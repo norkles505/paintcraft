@@ -10,26 +10,25 @@ import android.graphics.drawable.StateListDrawable
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
-import android.view.View.MeasureSpec
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 
-enum class AppMode { LAYOUT }
-enum class LayoutTool { SELECT, MOVE, ROTATE, SCALE, PAINT }
-
 private const val REQ_IMPORT_OBJ = 4101
 
+/**
+ * Pantalla unica de la app de pintura: vista 3D (un dedo pinta, dos dedos mueven la camara), panel de pintura abajo,
+ * columna de botones a la derecha (zoom, mano, candado, deshacer/rehacer), menu File arriba a la izquierda y menu de
+ * puntos de vista (Top, Front...) arriba al centro.
+ */
 class MainActivity : Activity() {
 
     private lateinit var glView: MyGLSurfaceView
     private lateinit var gizmoView: GizmoView
-    private lateinit var gizmoLabelView: GizmoLabelView
 
     private lateinit var handButton: ImageView
     private lateinit var lockButton: ImageView
@@ -37,75 +36,38 @@ class MainActivity : Activity() {
     private lateinit var fileButton: ImageView
     private lateinit var layoutTab: ImageView
 
-    private lateinit var leftToolColumn: LinearLayout
-    private lateinit var selectToolBtn: ImageView
-    private lateinit var moveToolBtn: ImageView
-    private lateinit var rotateToolBtn: ImageView
-    private lateinit var scaleToolBtn: ImageView
-    /** Herramienta Paint de Layout (ver LayoutTool.PAINT y MyGLRenderer.paintStart/paintMove): pinta sobre los modelos importados. */
-    private lateinit var paintToolBtn: ImageView
-    /** Selector Global/Local del gizmo activo (ver TransformOrientation en MyGLRenderer) - solo visible con Move/Rotate/Scale, no con Select ni Paint (ver updateOrientationToggleVisibility). */
-    private lateinit var orientationToggleBtn: ImageView
+    private lateinit var rightToolColumn: LinearLayout
+    private lateinit var paintPanel: PaintPanel
 
-    private var currentLayoutTool: LayoutTool = LayoutTool.SELECT
+    /** true mientras el panel de color de PaintPanel esta abierto (ver PaintPanel.onColorPanelVisible). */
+    private var colorPanelOpen = false
 
-    /**
-     * Eje al que quedo restringido el arrastre actual (X/Y/Z), si empezo tocando el gizmo (ver
-     * onViewportDragStart) - null si el arrastre es libre. Aplica con Move (flechas, ver
-     * hitTestGizmoAxis), Rotate (anillos, ver hitTestGizmoRotateAxis) y Scale (cubitos, ver
-     * hitTestGizmoScaleAxis) activos.
-     */
-    private var axisLocked: Char? = null
+    private var viewMenuPopup: PopupWindow? = null
 
-    private var modeMenuPopup: PopupWindow? = null
-
-    // Categorias del menu de Layout (estilo Blender: View / Select / Add / Object).
-    private val layoutMenuCategories = listOf("View", "Select", "Add", "Object")
-
-    /** Viewpoint reutiliza los mismos angulos que ya usa el gizmo de ejes (ver GizmoView / animateCameraTo). */
-    private data class ViewpointOption(val label: String, val angleX: Float, val angleY: Float, val planeAxis: Char)
+    /** Puntos de vista: reutilizan los mismos angulos que el gizmo de ejes (ver GizmoView / animateCameraTo). */
+    private data class ViewpointOption(val label: String, val angleX: Float, val angleY: Float)
     private val viewpointOptions = listOf(
-        ViewpointOption("Top", 90f, 0f, 'Z'),
-        ViewpointOption("Bottom", -90f, 0f, 'Z'),
-        ViewpointOption("Front", 0f, 0f, 'Y'),
-        ViewpointOption("Back", 0f, 180f, 'Y'),
-        ViewpointOption("Right", 0f, -90f, 'X'),
-        ViewpointOption("Left", 0f, 90f, 'X')
+        ViewpointOption("Top", 90f, 0f),
+        ViewpointOption("Bottom", -90f, 0f),
+        ViewpointOption("Front", 0f, 0f),
+        ViewpointOption("Back", 0f, 180f),
+        ViewpointOption("Right", 0f, -90f),
+        ViewpointOption("Left", 0f, 90f)
     )
-
-    /** Categorias de Layout > Add, con su icono propio. Solo Mesh tiene contenido real. */
-    private data class AddMenuEntry(val label: String, val iconRes: Int)
-    private val meshPrimitiveEntries = listOf(
-        AddMenuEntry("Plane", R.drawable.ic_mesh_plane),
-        AddMenuEntry("Cube", R.drawable.ic_mesh_cube),
-        AddMenuEntry("Circle", R.drawable.ic_mesh_circle),
-        AddMenuEntry("UV Sphere", R.drawable.ic_mesh_uv_sphere),
-        AddMenuEntry("Ico Sphere", R.drawable.ic_mesh_ico_sphere),
-        AddMenuEntry("Cylinder", R.drawable.ic_mesh_cylinder),
-        AddMenuEntry("Cone", R.drawable.ic_mesh_cone),
-        AddMenuEntry("Torus", R.drawable.ic_mesh_torus),
-        AddMenuEntry("Grid", R.drawable.ic_mesh_grid),
-        AddMenuEntry("Monkey", R.drawable.ic_mesh_monkey)
-    )
-
-    /** Contenido de Layout > Object: solo las acciones que tienen logica real (ver onObjectMenuAction). */
-    private val objectMenuItems = listOf("Duplicate Objects", "Show/Hide", "Clear", "Delete")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         glView = MyGLSurfaceView(this)
         gizmoView = GizmoView(this)
-        gizmoLabelView = GizmoLabelView(this)
 
         gizmoView.angleXProvider = { glView.renderer.angleX }
         gizmoView.angleYProvider = { glView.renderer.angleY }
         glView.onRotationChanged = { gizmoView.invalidate() }
-        gizmoView.onAxisSelected = { targetX, targetY, axisChar -> animateCameraTo(targetX, targetY, axisChar) }
-        glView.onTap = { x, y -> onViewportTap(x, y) }
-        glView.onDragMove = { dx, dy, x, y -> onViewportDragMove(dx, dy, x, y) }
-        glView.onDragStart = { x, y -> onViewportDragStart(x, y) }
-        glView.onDragEnd = { onViewportDragEnd() }
+        gizmoView.onAxisSelected = { targetX, targetY, _ -> animateCameraTo(targetX, targetY) }
+        // Pintar usa OpenGL: los eventos de la vista pasan al hilo de render.
+        glView.onPaintStart = { x, y -> glView.queueEvent { glView.renderer.paintStart(x, y) } }
+        glView.onPaintMove = { x, y -> glView.queueEvent { glView.renderer.paintMove(x, y) } }
 
         val root = FrameLayout(this)
         root.addView(
@@ -117,7 +79,6 @@ class MainActivity : Activity() {
         )
 
         val density = resources.displayMetrics.density
-        root.addView(gizmoLabelView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         val gizmoSize = (68 * density).toInt()
         val margin = (16 * density).toInt()
         val gizmoParams = FrameLayout.LayoutParams(gizmoSize, gizmoSize)
@@ -126,22 +87,14 @@ class MainActivity : Activity() {
         gizmoParams.rightMargin = margin
         root.addView(gizmoView, gizmoParams)
 
-        root.addView(buildToolButtonColumn(), FrameLayout.LayoutParams(
+        rightToolColumn = buildToolButtonColumn()
+        root.addView(rightToolColumn, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.END
             rightMargin = margin
             bottomMargin = margin
-        })
-
-        leftToolColumn = buildLeftToolColumn()
-        root.addView(leftToolColumn, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            leftMargin = margin
         })
 
         root.addView(buildTopBar(), FrameLayout.LayoutParams(
@@ -152,7 +105,29 @@ class MainActivity : Activity() {
             topMargin = margin
         })
 
+        // Panel de pintura (estilo ibisPaint): se agrega al final para quedar encima de todo. Siempre visible (con su triangulo para ocultarlo).
+        paintPanel = PaintPanel(this, glView.renderer)
+        // Con el panel de color abierto se esconde la columna de botones de la derecha; al cerrarlo vuelve.
+        paintPanel.onColorPanelVisible = { open ->
+            colorPanelOpen = open
+            updateSideColumnsVisibility()
+        }
+        // El panel cambia de alto al abrir/cerrar sus paneles desplegables: la columna de la derecha se acomoda despues de cada layout.
+        paintPanel.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
+            if (bottom - top != oldBottom - oldTop) paintPanel.post { updateRightColumnInset() }
+        }
+        root.addView(paintPanel, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.BOTTOM
+            leftMargin = (8 * density).toInt()
+            rightMargin = (8 * density).toInt()
+            bottomMargin = (8 * density).toInt()
+        })
+
         setContentView(root)
+        updateRightColumnInset()
     }
 
     private fun buildTopBar(): FrameLayout {
@@ -171,9 +146,9 @@ class MainActivity : Activity() {
         fileParams.leftMargin = margin
         bar.addView(fileButton, fileParams)
 
-        // Layout: boton centrado que abre el menu View / Select / Add / Object.
+        // Layout: boton centrado que abre la lista de puntos de vista.
         layoutTab = createIconButton(R.drawable.ic_layout)
-        layoutTab.setOnClickListener { toggleModeMenu(AppMode.LAYOUT, layoutTab) }
+        layoutTab.setOnClickListener { toggleViewMenu(layoutTab) }
         layoutTab.background = circleBackground(true)
 
         val tabsParams = FrameLayout.LayoutParams(
@@ -186,154 +161,47 @@ class MainActivity : Activity() {
         return bar
     }
 
-    private fun toggleModeMenu(mode: AppMode, anchor: View) {
-        val existing = modeMenuPopup
+    private fun toggleViewMenu(anchor: View) {
+        val existing = viewMenuPopup
         if (existing != null && existing.isShowing) {
             existing.dismiss()
             return
         }
-        showModeMenu(mode, anchor)
+        showViewMenu(anchor)
     }
 
-    private fun showModeMenu(mode: AppMode, anchor: View) {
+    /** Menu de los 6 puntos de vista (Top, Bottom, Front, Back, Right, Left) - reusan animateCameraTo, igual que el gizmo de ejes. */
+    private fun showViewMenu(anchor: View) {
         val density = resources.displayMetrics.density
         val menuColumn = LinearLayout(this)
         menuColumn.orientation = LinearLayout.VERTICAL
-
-        val scrollContainer = maxHeightScrollView(360)
-        scrollContainer.background = menuBackground()
+        menuColumn.background = menuBackground()
         val vPad = (6 * density).toInt()
-        scrollContainer.setPadding(vPad, vPad, vPad, vPad)
-        scrollContainer.addView(menuColumn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
+        menuColumn.setPadding(vPad, vPad, vPad, vPad)
 
         val popup = PopupWindow(
-            scrollContainer,
+            menuColumn,
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
             true
         )
         popup.isOutsideTouchable = true
         popup.elevation = 12 * density
+        popup.setOnDismissListener { viewMenuPopup = null }
 
-        leftToolColumn.visibility = View.GONE
-        popup.setOnDismissListener {
-            modeMenuPopup = null
-            leftToolColumn.visibility = View.VISIBLE
-        }
-
-        fillModeMenuWithCategories(menuColumn, mode, popup)
-
-        modeMenuPopup = popup
-        popup.showAsDropDown(anchor, 0, (8 * density).toInt())
-    }
-
-    /** ScrollView que nunca crece mas alla de maxHeightDp, para que menus largos no se salgan de la pantalla. */
-    private fun maxHeightScrollView(maxHeightDp: Int): ScrollView {
-        val maxHeightPx = (maxHeightDp * resources.displayMetrics.density).toInt()
-        return object : ScrollView(this) {
-            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-                val mode = MeasureSpec.getMode(heightMeasureSpec)
-                val newHeightSpec = if (mode == MeasureSpec.UNSPECIFIED) {
-                    MeasureSpec.makeMeasureSpec(maxHeightPx, MeasureSpec.AT_MOST)
-                } else {
-                    val capped = minOf(MeasureSpec.getSize(heightMeasureSpec), maxHeightPx)
-                    MeasureSpec.makeMeasureSpec(capped, MeasureSpec.AT_MOST)
-                }
-                super.onMeasure(widthMeasureSpec, newHeightSpec)
-            }
-        }
-    }
-
-    private fun fillModeMenuWithCategories(menuColumn: LinearLayout, mode: AppMode, popup: PopupWindow) {
-        menuColumn.removeAllViews()
-        for (category in layoutMenuCategories) {
-            menuColumn.addView(buildSimpleMenuRow(category) {
-                fillModeMenuWithCategoryContent(menuColumn, mode, category, popup)
-            })
-        }
-        if (popup.isShowing) {
-            popup.update(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-    }
-
-    /** Dispatcher: decide que render function usar segun la categoria elegida. */
-    private fun fillModeMenuWithCategoryContent(menuColumn: LinearLayout, mode: AppMode, category: String, popup: PopupWindow) {
-        when (category) {
-            "View" -> renderViewMenu(menuColumn, mode, popup)
-            "Select" -> renderLayoutSelectMenu(menuColumn, popup)
-            "Add" -> renderLayoutAddMenu(menuColumn, popup)
-            "Object" -> renderLayoutObjectMenu(menuColumn, popup)
-        }
-    }
-
-    /** Layout > Select: solo "None" (deselecciona todo). Tocar espacio vacio en el viewport hace lo mismo. */
-    private fun renderLayoutSelectMenu(menuColumn: LinearLayout, popup: PopupWindow) {
-        menuColumn.removeAllViews()
-        menuColumn.addView(buildSimpleMenuRow("← Volver") {
-            fillModeMenuWithCategories(menuColumn, AppMode.LAYOUT, popup)
-        })
-        menuColumn.addView(buildSimpleMenuRow("None") {
-            popup.dismiss()
-            glView.renderer.deselectAll()
-            glView.requestRender()
-        })
-        if (popup.isShowing) {
-            popup.update(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-    }
-
-    /** Layout > View: los 6 puntos de vista (Top, Bottom, Front, Back, Right, Left) - reusan animateCameraTo, igual que el gizmo de ejes (ver viewpointOptions). */
-    private fun renderViewMenu(menuColumn: LinearLayout, mode: AppMode, popup: PopupWindow) {
-        menuColumn.removeAllViews()
-        menuColumn.addView(buildSimpleMenuRow("← Volver") {
-            fillModeMenuWithCategories(menuColumn, mode, popup)
-        })
         for (option in viewpointOptions) {
             menuColumn.addView(buildSimpleMenuRow(option.label) {
                 popup.dismiss()
-                animateCameraTo(option.angleX, option.angleY, option.planeAxis)
+                animateCameraTo(option.angleX, option.angleY)
             })
         }
-        if (popup.isShowing) {
-            popup.update(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
+
+        viewMenuPopup = popup
+        popup.showAsDropDown(anchor, 0, (8 * density).toInt())
     }
 
-    /** Layout > Add: directo a las primitivas de malla; todas crean geometria real via MyGLRenderer.addXxx(). */
-    private fun renderLayoutAddMenu(menuColumn: LinearLayout, popup: PopupWindow) {
-        menuColumn.removeAllViews()
-        menuColumn.addView(buildSimpleMenuRow("← Volver") {
-            fillModeMenuWithCategories(menuColumn, AppMode.LAYOUT, popup)
-        })
-        for (entry in meshPrimitiveEntries) {
-            menuColumn.addView(buildAddMenuItem(entry.iconRes, entry.label) {
-                popup.dismiss()
-                val r = glView.renderer
-                when (entry.label) {
-                    "Plane" -> r.addPlane()
-                    "Cube" -> r.addCube()
-                    "Circle" -> r.addCircle()
-                    "UV Sphere" -> r.addUvSphere()
-                    "Ico Sphere" -> r.addIcoSphere()
-                    "Cylinder" -> r.addCylinder()
-                    "Cone" -> r.addCone()
-                    "Torus" -> r.addTorus()
-                    "Grid" -> r.addGrid()
-                    "Monkey" -> r.addMonkey()
-                }
-                glView.requestRender()
-            })
-        }
-        if (popup.isShowing) {
-            popup.update(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-    }
-
-    /** Fila de menu con icono + texto, mismo estilo que buildFileMenuItem, reusada para Add. */
-    private fun buildAddMenuItem(iconRes: Int, label: String, onClick: () -> Unit): LinearLayout {
+    /** Fila de menu con icono + texto, usada por el menu File. */
+    private fun buildIconMenuItem(iconRes: Int, label: String, onClick: () -> Unit): LinearLayout {
         val density = resources.displayMetrics.density
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
@@ -370,52 +238,6 @@ class MainActivity : Activity() {
         return row
     }
 
-    private fun renderLayoutObjectMenu(menuColumn: LinearLayout, popup: PopupWindow) {
-        menuColumn.removeAllViews()
-        menuColumn.addView(buildSimpleMenuRow("← Volver") {
-            fillModeMenuWithCategories(menuColumn, AppMode.LAYOUT, popup)
-        })
-
-        for (item in objectMenuItems) {
-            menuColumn.addView(buildSimpleMenuRow(item) {
-                popup.dismiss()
-                onObjectMenuAction(item)
-            })
-        }
-
-        if (popup.isShowing) {
-            popup.update(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-    }
-
-    private fun onObjectMenuAction(action: String) {
-        when (action) {
-            "Delete" -> {
-                val hadSelection = glView.renderer.deleteSelectedObject()
-                glView.requestRender()
-                if (!hadSelection) Toast.makeText(this, "No hay objeto seleccionado", Toast.LENGTH_SHORT).show()
-            }
-            "Show/Hide" -> {
-                val didSomething = glView.renderer.toggleShowHideSelected()
-                glView.requestRender()
-                if (!didSomething) Toast.makeText(this, "No hay objeto seleccionado ni oculto", Toast.LENGTH_SHORT).show()
-            }
-            "Clear" -> {
-                val hadSelection = glView.renderer.clearSelectedObjectTransform()
-                glView.requestRender()
-                if (!hadSelection) Toast.makeText(this, "No hay objeto seleccionado", Toast.LENGTH_SHORT).show()
-            }
-            "Duplicate Objects" -> {
-                val duplicate = glView.renderer.duplicateSelectedObject()
-                glView.requestRender()
-                if (duplicate == null) Toast.makeText(this, "No hay objeto seleccionado", Toast.LENGTH_SHORT).show()
-            }
-            else -> {
-                Toast.makeText(this, action, Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
     private fun buildSimpleMenuRow(label: String, onClick: () -> Unit): LinearLayout {
         val density = resources.displayMetrics.density
         val row = LinearLayout(this)
@@ -441,196 +263,6 @@ class MainActivity : Activity() {
         return row
     }
 
-    private fun buildLeftToolColumn(): LinearLayout {
-        val density = resources.displayMetrics.density
-        val column = LinearLayout(this)
-        column.orientation = LinearLayout.VERTICAL
-
-        selectToolBtn = createIconButton(R.drawable.ic_select_box)
-        moveToolBtn = createIconButton(R.drawable.ic_move)
-        rotateToolBtn = createIconButton(R.drawable.ic_rotate)
-        scaleToolBtn = createIconButton(R.drawable.ic_scale)
-        paintToolBtn = createIconButton(R.drawable.ic_paint)
-        // Icono inicial Local (ver default de TransformOrientation en MyGLRenderer) - se actualiza
-        // en cada toggle (ver toggleTransformOrientation) para reflejar siempre el estado actual.
-        orientationToggleBtn = createIconButton(R.drawable.ic_orientation_local)
-
-        selectToolBtn.setOnClickListener { setLayoutTool(LayoutTool.SELECT) }
-        moveToolBtn.setOnClickListener { setLayoutTool(LayoutTool.MOVE) }
-        rotateToolBtn.setOnClickListener { setLayoutTool(LayoutTool.ROTATE) }
-        scaleToolBtn.setOnClickListener { setLayoutTool(LayoutTool.SCALE) }
-        paintToolBtn.setOnClickListener { setLayoutTool(LayoutTool.PAINT) }
-        orientationToggleBtn.setOnClickListener { toggleTransformOrientation() }
-
-        val spacing = (8 * density).toInt()
-        for (btn in listOf(selectToolBtn, moveToolBtn, rotateToolBtn, scaleToolBtn, paintToolBtn)) {
-            (btn.layoutParams as LinearLayout.LayoutParams).topMargin = spacing
-            column.addView(btn)
-        }
-        (selectToolBtn.layoutParams as LinearLayout.LayoutParams).topMargin = 0
-        // Separado con el doble de margen, para marcar que es una propiedad de las herramientas de transformacion y no una herramienta mas.
-        (orientationToggleBtn.layoutParams as LinearLayout.LayoutParams).topMargin = spacing * 2
-        column.addView(orientationToggleBtn)
-        updateOrientationToggleVisibility()
-
-        updateLayoutToolHighlight()
-
-        return column
-    }
-
-    /**
-     * Actualiza la visibilidad de orientationToggleBtn: visible solo con Move/Rotate/Scale (donde
-     * hay gizmo dibujado), oculto con Select y Paint (no habria nada en pantalla que el boton afecte).
-     */
-    private fun updateOrientationToggleVisibility() {
-        orientationToggleBtn.visibility = if (currentLayoutTool == LayoutTool.SELECT || currentLayoutTool == LayoutTool.PAINT) View.GONE else View.VISIBLE
-    }
-
-    /**
-     * Alterna transformOrientation entre GLOBAL y LOCAL (ver enum en MyGLRenderer), actualiza el
-     * icono del boton y muestra un Toast corto confirmando "Global" o "Local".
-     */
-    private fun toggleTransformOrientation() {
-        val renderer = glView.renderer
-        renderer.transformOrientation = if (renderer.transformOrientation == TransformOrientation.GLOBAL) {
-            TransformOrientation.LOCAL
-        } else {
-            TransformOrientation.GLOBAL
-        }
-        val isGlobal = renderer.transformOrientation == TransformOrientation.GLOBAL
-        orientationToggleBtn.setImageResource(
-            if (isGlobal) R.drawable.ic_orientation_global else R.drawable.ic_orientation_local
-        )
-        Toast.makeText(this, if (isGlobal) "Global" else "Local", Toast.LENGTH_SHORT).show()
-        glView.requestRender()
-    }
-
-    private fun setLayoutTool(tool: LayoutTool) {
-        // El gizmo se muestra con Move (flechas), Rotate (anillos) y Scale (cubitos).
-        glView.renderer.gizmoMode = when (tool) {
-            LayoutTool.MOVE -> GizmoMode.MOVE
-            LayoutTool.ROTATE -> GizmoMode.ROTATE
-            LayoutTool.SCALE -> GizmoMode.SCALE
-            else -> null
-        }
-        currentLayoutTool = tool
-        // Con Paint se oculta la grilla del piso para que no estorbe sobre el modelo.
-        glView.renderer.showGrid = (tool != LayoutTool.PAINT)
-        updateOrientationToggleVisibility()
-        updateLayoutToolHighlight()
-    }
-
-    private fun updateLayoutToolHighlight() {
-        selectToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.SELECT)
-        moveToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.MOVE)
-        rotateToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.ROTATE)
-        scaleToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.SCALE)
-        paintToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.PAINT)
-    }
-
-    /**
-     * ACTION_DOWN en el viewport. Con Paint: pinta en el hilo de render. Con Move, Rotate o Scale
-     * y un objeto seleccionado: guarda un snapshot de Undo y hace el hit-test contra el gizmo
-     * correspondiente (flechas via hitTestGizmoAxis, anillos via hitTestGizmoRotateAxis, cubitos
-     * via hitTestGizmoScaleAxis). Si el dedo toco el gizmo, el arrastre queda restringido a ese eje
-     * (ver onViewportDragMove); si no, cae al gesto libre.
-     */
-    private fun onViewportDragStart(x: Float, y: Float) {
-        axisLocked = null
-        if (currentLayoutTool == LayoutTool.PAINT) {
-            // Paint: el toque pinta en el hilo de render (usa OpenGL), ver MyGLRenderer.paintStart.
-            glView.queueEvent { glView.renderer.paintStart(x, y) }
-            return
-        }
-        if (currentLayoutTool == LayoutTool.MOVE || currentLayoutTool == LayoutTool.ROTATE || currentLayoutTool == LayoutTool.SCALE) {
-            if (glView.renderer.sceneObjects.any { it.selected }) {
-                glView.renderer.pushUndoSnapshot()
-            }
-        }
-        axisLocked = when (currentLayoutTool) {
-            LayoutTool.MOVE -> glView.renderer.hitTestGizmoAxis(x, y)
-            LayoutTool.ROTATE -> glView.renderer.hitTestGizmoRotateAxis(x, y)
-            LayoutTool.SCALE -> glView.renderer.hitTestGizmoScaleAxis(x, y)
-            else -> null
-        }
-        glView.renderer.activeRotateAxis = null
-        glView.renderer.activeMoveAxis = if (currentLayoutTool == LayoutTool.MOVE) axisLocked else null
-        glView.renderer.activeScaleAxis = if (currentLayoutTool == LayoutTool.SCALE) axisLocked else null
-        gizmoLabelView.labelText = null
-        if (currentLayoutTool == LayoutTool.ROTATE && axisLocked != null) {
-            val axisNow = axisLocked!!
-            glView.renderer.activeRotateAxis = axisNow
-            val anchor = glView.renderer.computeRotateLabelAnchor()
-            if (anchor != null) {
-                gizmoLabelView.labelText = axisNow.toString()
-                gizmoLabelView.labelX = anchor[0]
-                gizmoLabelView.labelY = anchor[1]
-            }
-        }
-        gizmoLabelView.invalidate()
-    }
-
-    /** ACTION_UP en el viewport: suelta el eje bloqueado y limpia el resaltado del eje agarrado y la etiqueta de texto. */
-    private fun onViewportDragEnd() {
-        axisLocked = null
-        glView.renderer.activeRotateAxis = null
-        glView.renderer.activeMoveAxis = null
-        glView.renderer.activeScaleAxis = null
-        gizmoLabelView.labelText = null
-        gizmoLabelView.invalidate()
-    }
-
-    /** Tap en el viewport 3D: con la herramienta Select activa, selecciona el objeto tocado (o deselecciona todo si el tap cae en espacio vacio). */
-    private fun onViewportTap(x: Float, y: Float) {
-        if (currentLayoutTool != LayoutTool.SELECT) return
-        glView.renderer.selectObjectAt(x, y)
-        glView.requestRender()
-    }
-
-    /**
-     * Arrastre en el viewport 3D. Con Paint pinta y NO rota la camara (devolver true consume el
-     * gesto, ver MyGLSurfaceView). Con Move/Rotate/Scale transforma el objeto seleccionado (libre,
-     * o restringido a eje si el arrastre empezo tocando el gizmo). Con Select devuelve false y el
-     * gesto rota la camara.
-     */
-    private fun onViewportDragMove(dx: Float, dy: Float, x: Float, y: Float): Boolean {
-        if (currentLayoutTool == LayoutTool.PAINT) {
-            glView.queueEvent { glView.renderer.paintMove(x, y) }
-            return true
-        }
-        return when (currentLayoutTool) {
-            LayoutTool.MOVE -> {
-                val axis = axisLocked
-                if (axis != null) {
-                    glView.renderer.moveSelectedObjectOnAxis(dx, dy, axis)
-                } else {
-                    glView.renderer.moveSelectedObject(dx, dy)
-                }
-                true
-            }
-            LayoutTool.ROTATE -> {
-                val axis = axisLocked
-                if (axis != null) {
-                    glView.renderer.updateActiveRotateCurrentDir(x, y, axis)
-                    glView.renderer.rotateSelectedObjectOnAxis(dx, dy, axis)
-                } else {
-                    glView.renderer.rotateSelectedObject(dx, dy)
-                }
-                true
-            }
-            LayoutTool.SCALE -> {
-                val axis = axisLocked
-                if (axis != null) {
-                    glView.renderer.scaleSelectedObjectOnAxis(dx, dy, axis)
-                } else {
-                    glView.renderer.scaleSelectedObject(dy)
-                }
-                true
-            }
-            else -> false
-        }
-    }
-
     private fun showFileMenu(anchor: View) {
         val density = resources.displayMetrics.density
         val menuColumn = LinearLayout(this)
@@ -653,28 +285,24 @@ class MainActivity : Activity() {
             fileButton.background = circleBackground(false)
         }
 
-        menuColumn.addView(buildFileMenuItem(R.drawable.ic_new, "New") {
+        menuColumn.addView(buildIconMenuItem(R.drawable.ic_new, "New") {
             popup.dismiss()
             onFileMenuAction("New")
         })
-        menuColumn.addView(buildFileMenuItem(R.drawable.ic_save, "Save") {
+        menuColumn.addView(buildIconMenuItem(R.drawable.ic_save, "Save") {
             popup.dismiss()
             onFileMenuAction("Save")
         })
-        menuColumn.addView(buildFileMenuItem(R.drawable.ic_import, "Import") {
+        menuColumn.addView(buildIconMenuItem(R.drawable.ic_import, "Import") {
             popup.dismiss()
             onFileMenuAction("Import")
         })
-        menuColumn.addView(buildFileMenuItem(R.drawable.ic_export, "Export") {
+        menuColumn.addView(buildIconMenuItem(R.drawable.ic_export, "Export") {
             popup.dismiss()
             onFileMenuAction("Export")
         })
 
         popup.showAsDropDown(anchor, 0, (8 * density).toInt())
-    }
-
-    private fun buildFileMenuItem(iconRes: Int, label: String, onClick: () -> Unit): LinearLayout {
-        return buildAddMenuItem(iconRes, label, onClick)
     }
 
     /**
@@ -684,7 +312,6 @@ class MainActivity : Activity() {
     private fun onFileMenuAction(action: String) {
         if (action == "New") {
             glView.renderer.newProject()
-            onViewportDragEnd()
             glView.requestRender()
             Toast.makeText(this, "Nuevo proyecto", Toast.LENGTH_SHORT).show()
             return
@@ -753,10 +380,9 @@ class MainActivity : Activity() {
             lockButton.background = circleBackground(glView.isLocked)
         }
 
-        // Undo/Redo: pila de snapshots completos de sceneObjects (ver MyGLRenderer.undo/redo).
+        // Undo/Redo: pila de snapshots de la escena (ver MyGLRenderer.undo/redo). Todavia no cubre los trazos de pintura.
         undoBtn.setOnClickListener {
             if (glView.renderer.undo()) {
-                onViewportDragEnd()
                 glView.requestRender()
             } else {
                 Toast.makeText(this, "Nada para deshacer", Toast.LENGTH_SHORT).show()
@@ -764,7 +390,6 @@ class MainActivity : Activity() {
         }
         redoBtn.setOnClickListener {
             if (glView.renderer.redo()) {
-                onViewportDragEnd()
                 glView.requestRender()
             } else {
                 Toast.makeText(this, "Nada para rehacer", Toast.LENGTH_SHORT).show()
@@ -778,6 +403,20 @@ class MainActivity : Activity() {
         }
 
         return column
+    }
+
+    /** Esconde la columna de botones de la derecha mientras el panel de color esta abierto; al cerrarlo vuelve. */
+    private fun updateSideColumnsVisibility() {
+        rightToolColumn.visibility = if (colorPanelOpen) View.GONE else View.VISIBLE
+    }
+
+    /** Sube la columna de botones de la derecha (zoom, mano, undo...) para que el panel de pintura no la tape. */
+    private fun updateRightColumnInset() {
+        val density = resources.displayMetrics.density
+        val panelDp = if (paintPanel.height > 0) (paintPanel.height / density).toInt() + 8 else 72
+        val lp = rightToolColumn.layoutParams as FrameLayout.LayoutParams
+        lp.bottomMargin = (16 * density).toInt() + (panelDp * density).toInt()
+        rightToolColumn.layoutParams = lp
     }
 
     private fun createIconButton(iconRes: Int): ImageView {
@@ -799,17 +438,16 @@ class MainActivity : Activity() {
             shape = GradientDrawable.OVAL
             color = if (active) {
                 // Blender-style orange, matching the selection outline color.
-                android.content.res.ColorStateList.valueOf(Color.argb(235, 242, 128, 26))
+                ColorStateList.valueOf(Color.argb(235, 242, 128, 26))
             } else {
-                android.content.res.ColorStateList.valueOf(Color.argb(150, 40, 40, 40))
+                ColorStateList.valueOf(Color.argb(150, 40, 40, 40))
             }
         }
     }
 
-    private fun animateCameraTo(targetAngleX: Float, targetAngleY: Float, axisChar: Char) {
+    private fun animateCameraTo(targetAngleX: Float, targetAngleY: Float) {
         val renderer = glView.renderer
         renderer.isOrthographic = true
-        renderer.gridPlaneAxis = axisChar
         val startX = renderer.angleX
         val startY = renderer.angleY
         val deltaX = shortestDelta(startX, targetAngleX)

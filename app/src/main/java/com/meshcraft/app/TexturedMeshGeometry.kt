@@ -24,9 +24,25 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
 
     // Lado de la textura (cuadrada) y copia en CPU de sus pixeles RGBA (ver paintDab): se pinta en esta copia y solo
     // la zona tocada se sube a la GPU con glTexSubImage2D. paintScratch: buffer temporal para esa subida parcial.
-    private val texSize = 1024
+    val texSize = 1024
     private var paintPixels: ByteBuffer? = null
     private var paintScratch: ByteBuffer? = null
+
+    // Trazo en curso (ver beginStroke / paintDab): strokeAlpha = la mayor opacidad aplicada a cada texel en la pasada actual
+    // (0 = sin tocar), strokeBase = color RGB que tenia cada texel ANTES del trazo. Cada toque se mezcla con ese color
+    // original usando el maximo de los alphas, asi los toques seguidos de una misma pasada no acumulan opacidad (una pasada nunca pasa de la opacidad elegida), pero volver a pasar por el mismo lugar suma.
+    private val strokeAlpha = FloatArray(texSize * texSize)
+    private val strokeBase = ByteArray(texSize * texSize * 3)
+    // Rectangulo (en texeles) que toco el trazo, para limpiar strokeAlpha sin recorrer toda la textura.
+    private var strokeMinX = texSize
+    private var strokeMinY = texSize
+    private var strokeMaxX = -1
+    private var strokeMaxY = -1
+    // Numero de toque dentro del trazo y, por texel, el ultimo toque que lo toco: si pasan mas de STROKE_NEW_PASS_GAP toques
+    // sin tocarlo, el trazo se fue y volvio (cruce sobre si mismo) y esa vuelta cuenta como una pasada nueva que se suma.
+    private val strokeLastDab = IntArray(texSize * texSize)
+    private var strokeDab = 0
+    private val STROKE_NEW_PASS_GAP = 3
 
     private val vertexShaderCode = """
         uniform mat4 uMVPMatrix;
@@ -269,7 +285,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * afuera. Se pinta en la copia en CPU (paintPixels) y solo el rectangulo tocado se sube a la GPU con
      * glTexSubImage2D. IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
      */
-    fun paintDab(u: Float, v: Float, radius: Float, r: Int, g: Int, b: Int) {
+    fun paintDab(u: Float, v: Float, radius: Float, r: Int, g: Int, b: Int, opacity: Float = 1f, brushType: BrushType = BrushType.SOFT) {
         val pix = paintPixels ?: return
         val cx = u * (texSize - 1)
         val cy = v * (texSize - 1)
@@ -278,6 +294,11 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         val y0 = maxOf(0, Math.floor((cy - radius).toDouble()).toInt())
         val y1 = minOf(texSize - 1, Math.ceil((cy + radius).toDouble()).toInt())
         if (x1 < x0 || y1 < y0) return
+        if (x0 < strokeMinX) strokeMinX = x0
+        if (y0 < strokeMinY) strokeMinY = y0
+        if (x1 > strokeMaxX) strokeMaxX = x1
+        if (y1 > strokeMaxY) strokeMaxY = y1
+        strokeDab++
 
         for (y in y0..y1) {
             for (x in x0..x1) {
@@ -285,11 +306,34 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
                 val ddy = y - cy
                 val d = Math.sqrt((ddx * ddx + ddy * ddy).toDouble()).toFloat()
                 if (d >= radius) continue
-                val alpha = minOf(1f, (1f - d / radius) * 2f)
+                // Borde segun el tipo de pincel: SOFT opaco en la mitad interior y se desvanece; HARD casi sin desvanecer;
+                // AIRBRUSH baja de forma cuadratica desde el centro (aerografo).
+                val t = 1f - d / radius
+                val falloff = when (brushType) {
+                    BrushType.SOFT -> minOf(1f, t * 2f)
+                    BrushType.HARD -> minOf(1f, t * 8f)
+                    BrushType.AIRBRUSH -> t * t
+                }
+                val dabAlpha = falloff * opacity
+                val idx = y * texSize + x
+                var prevAlpha = strokeAlpha[idx]
+                // Pasada nueva: el trazo se fue de este texel y volvio. Se parte del color que tiene ahora (con lo ya pintado) para que se sume.
+                if (prevAlpha > 0f && strokeDab - strokeLastDab[idx] > STROKE_NEW_PASS_GAP) prevAlpha = 0f
+                strokeLastDab[idx] = strokeDab
+                // Este texel ya tiene al menos esta opacidad en el trazo actual: nada que sumar.
+                if (dabAlpha <= prevAlpha) continue
+                if (prevAlpha == 0f) {
+                    // Primera vez que el trazo toca este texel: recuerda su color de antes del trazo.
+                    strokeBase[idx * 3] = pix.get(idx * 4)
+                    strokeBase[idx * 3 + 1] = pix.get(idx * 4 + 1)
+                    strokeBase[idx * 3 + 2] = pix.get(idx * 4 + 2)
+                }
+                strokeAlpha[idx] = dabAlpha
+                val alpha = dabAlpha
                 val o = (y * texSize + x) * 4
-                val oldR = pix.get(o).toInt() and 0xFF
-                val oldG = pix.get(o + 1).toInt() and 0xFF
-                val oldB = pix.get(o + 2).toInt() and 0xFF
+                val oldR = strokeBase[idx * 3].toInt() and 0xFF
+                val oldG = strokeBase[idx * 3 + 1].toInt() and 0xFF
+                val oldB = strokeBase[idx * 3 + 2].toInt() and 0xFF
                 pix.put(o, (oldR + (r - oldR) * alpha).toInt().toByte())
                 pix.put(o + 1, (oldG + (g - oldG) * alpha).toInt().toByte())
                 pix.put(o + 2, (oldB + (b - oldB) * alpha).toInt().toByte())
@@ -330,6 +374,34 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         GLES20.glDeleteProgram(lineProgram)
         paintPixels = null
         paintScratch = null
+    }
+
+    /**
+     * Empieza un trazo nuevo: olvida el trazo anterior (limpia strokeAlpha solo en el rectangulo que toco) para que los
+     * toques de este trazo se midan contra el color actual de la textura. Llamar al apoyar el dedo, antes del primer toque.
+     */
+    fun beginStroke() {
+        if (strokeMaxX >= strokeMinX && strokeMaxY >= strokeMinY) {
+            for (y in strokeMinY..strokeMaxY) {
+                java.util.Arrays.fill(strokeAlpha, y * texSize + strokeMinX, y * texSize + strokeMaxX + 1, 0f)
+            }
+        }
+        strokeMinX = texSize
+        strokeMinY = texSize
+        strokeMaxX = -1
+        strokeMaxY = -1
+    }
+
+    /**
+     * Color (RGB, 0..255) de la textura en (u, v) (0..1), leido de la copia en CPU - lo usa el cuentagotas.
+     * Devuelve null si la geometria ya fue liberada. No llama a OpenGL.
+     */
+    fun pickColor(u: Float, v: Float): IntArray? {
+        val pix = paintPixels ?: return null
+        val x = (u * (texSize - 1)).toInt().coerceIn(0, texSize - 1)
+        val y = (v * (texSize - 1)).toInt().coerceIn(0, texSize - 1)
+        val o = (y * texSize + x) * 4
+        return intArrayOf(pix.get(o).toInt() and 0xFF, pix.get(o + 1).toInt() and 0xFF, pix.get(o + 2).toInt() and 0xFF)
     }
 
     private fun drawFaces(mvpMatrix: FloatArray, normalMatrix: FloatArray) {

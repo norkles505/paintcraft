@@ -1,0 +1,18 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="28dp"
+    android:height="28dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Tipo de pincel: circulo lleno con anillos que se desvanecen hacia afuera (borde suave). -->
+    <path
+        android:pathData="M12,8 a4,4 0 1,0 0.001,0 Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M12,5 a7,7 0 1,0 0.001,0 Z M12,6.5 a5.5,5.5 0 1,1 -0.001,0 Z"
+        android:fillColor="#B3FFFFFF"
+        android:fillType="evenOdd" />
+    <path
+        android:pathData="M12,2.5 a9.5,9.5 0 1,0 0.001,0 Z M12,4 a8,8 0 1,1 -0.001,0 Z"
+        android:fillColor="#59FFFFFF"
+        android:fillType="evenOdd" />
+</vector>

@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Paleta: cuadricula de 3x3 cuadritos. -->
+    <path
+        android:pathData="M2,2h5v5H2z M9.5,2h5v5h-5z M17,2h5v5h-5z M2,9.5h5v5H2z M9.5,9.5h5v5h-5z M17,9.5h5v5h-5z M2,17h5v5H2z M9.5,17h5v5h-5z M17,17h5v5h-5z"
+        android:fillColor="#FFFFFF" />
+</vector>

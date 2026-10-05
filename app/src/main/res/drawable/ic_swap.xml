@@ -1,0 +1,19 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="28dp"
+    android:height="28dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <!-- Intercambiar: dos flechas opuestas (boton Cambiar del panel de pintura). Solo trazo, sin relleno. -->
+    <path
+        android:pathData="M 562.84325,189.04429 H 186.52747 m 376.31578,0 L 437.40561,58.781151 M 562.84325,189.04429 437.40561,319.30745"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="57.8947"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M 70.737991,449.57061 H 447.05377 m -376.315779,0 125.438499,130.26316 M 70.737991,449.57061 196.17649,319.30745"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="57.8947"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
