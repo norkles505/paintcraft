@@ -319,6 +319,19 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
     }
 
+    /**
+     * Libera los recursos de GPU de esta geometria (VBO, textura y los dos programas de shaders) y la copia de la
+     * textura en CPU. IMPORTANTE: llamar desde el hilo de render, y no volver a usar esta instancia despues.
+     */
+    fun release() {
+        GLES20.glDeleteBuffers(1, intArrayOf(vbo), 0)
+        GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+        GLES20.glDeleteProgram(program)
+        GLES20.glDeleteProgram(lineProgram)
+        paintPixels = null
+        paintScratch = null
+    }
+
     private fun drawFaces(mvpMatrix: FloatArray, normalMatrix: FloatArray) {
         GLES20.glUseProgram(program)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vbo)
