@@ -49,6 +49,14 @@ data class SceneObject(
     var rotationMatrix: FloatArray = FloatArray(16).apply { Matrix.setIdentityM(this, 0) },
     var shapeMatrix: FloatArray = FloatArray(16).apply { Matrix.setIdentityM(this, 0) },
     var selected: Boolean = false,
-    var editableMesh: EditableMesh? = null
+    var editableMesh: EditableMesh? = null,
+    /**
+     * Object > Show/Hide (ver MyGLRenderer.toggleShowHideSelected) - objetos ocultos no se dibujan
+     * (ver onDrawFrame) ni son alcanzables por raycast (ver selectObjectAt), mismo criterio que
+     * Blender: un objeto oculto no se puede seleccionar tocandolo, solo mostrando todo de nuevo.
+     */
+    var visible: Boolean = true,
+    /** Modelo importado desde OBJ (ver ObjLoader y TexturedMeshGeometry): si no es null, se dibuja en vez de la geometria de type. */
+    var importedMesh: ObjMesh? = null
 
 )

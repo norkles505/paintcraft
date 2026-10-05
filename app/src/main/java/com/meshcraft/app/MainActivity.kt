@@ -2,6 +2,7 @@ package com.meshcraft.app
 
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -20,9 +21,11 @@ import android.widget.TextView
 import android.widget.Toast
 
 enum class AppMode { LAYOUT, MODELING, UV_EDITING }
-enum class LayoutTool { SELECT, MOVE, ROTATE, SCALE }
+enum class LayoutTool { SELECT, MOVE, ROTATE, SCALE, PAINT }
 /** Modo de selección de sub-elemento dentro de Edit Mode (Modeling) - toggle Vertex/Edge/Face, mismo criterio que Blender. */
 enum class EditSelectMode { VERTEX, EDGE, FACE }
+
+private const val REQ_IMPORT_OBJ = 4101
 
 class MainActivity : Activity() {
 
@@ -34,6 +37,8 @@ class MainActivity : Activity() {
     private lateinit var lockButton: ImageView
 
     private lateinit var fileButton: ImageView
+    private lateinit var generalButton: ImageView
+    private lateinit var dataButton: ImageView
     private lateinit var layoutTab: ImageView
     private lateinit var modelingTab: ImageView
     private lateinit var uvEditingTab: ImageView
@@ -43,6 +48,8 @@ class MainActivity : Activity() {
     private lateinit var moveToolBtn: ImageView
     private lateinit var rotateToolBtn: ImageView
     private lateinit var scaleToolBtn: ImageView
+    /** Herramienta Paint de Layout (ver LayoutTool.PAINT y MyGLRenderer.paintStart/paintMove): pinta sobre los modelos importados. */
+    private lateinit var paintToolBtn: ImageView
     /** Selector Global/Local del gizmo activo (ver TransformOrientation en MyGLRenderer) - solo visible con Move/Rotate/Scale, no con Select (ver updateOrientationToggleVisibility). */
     private lateinit var orientationToggleBtn: ImageView
 
@@ -532,8 +539,20 @@ class MainActivity : Activity() {
         modelingTab.setOnClickListener { onModeTabClicked(AppMode.MODELING, modelingTab) }
         uvEditingTab.setOnClickListener { onModeTabClicked(AppMode.UV_EDITING, uvEditingTab) }
 
+        // General / Data: no son un AppMode mas (no cambian herramientas ni gizmo, ver charla con
+        // el usuario) - dos botones independientes, mismo estilo que los tabs de modo, que abren
+        // su propio popup (mismo patron que showFileMenu). Por ahora solo "Proximamente"
+        // (renderPendingSubmenu) - el plan acordado para cuando se retome esto es sumar el
+        // Outliner (lista de objetos) y un tab Object con transform numerico como primer
+        // contenido real, ya que ninguno de los dos depende de sistemas todavia sin construir
+        // (a diferencia de Modifier/Material/Data de malla, que si).
+        generalButton = createIconButton(R.drawable.ic_general)
+        dataButton = createIconButton(R.drawable.ic_data)
+        generalButton.setOnClickListener { showGeneralOrDataMenu(it, "General") }
+        dataButton.setOnClickListener { showGeneralOrDataMenu(it, "Data") }
+
         val spacing = (8 * density).toInt()
-        for (tab in listOf(layoutTab, modelingTab, uvEditingTab)) {
+        for (tab in listOf(layoutTab, generalButton, dataButton)) {
             (tab.layoutParams as LinearLayout.LayoutParams).leftMargin = spacing
             tabsRow.addView(tab)
         }
@@ -1553,6 +1572,21 @@ class MainActivity : Activity() {
                 glView.requestRender()
                 if (!hadSelection) Toast.makeText(this, "No hay objeto seleccionado", Toast.LENGTH_SHORT).show()
             }
+            "Show/Hide" -> {
+                val didSomething = glView.renderer.toggleShowHideSelected()
+                glView.requestRender()
+                if (!didSomething) Toast.makeText(this, "No hay objeto seleccionado ni oculto", Toast.LENGTH_SHORT).show()
+            }
+            "Set Origin" -> {
+                val hadSelection = glView.renderer.setOriginToGeometrySelected()
+                glView.requestRender()
+                if (!hadSelection) Toast.makeText(this, "No hay objeto seleccionado", Toast.LENGTH_SHORT).show()
+            }
+            "Apply" -> {
+                val hadSelection = glView.renderer.applySelectedObjectTransform()
+                glView.requestRender()
+                if (!hadSelection) Toast.makeText(this, "No hay objeto seleccionado", Toast.LENGTH_SHORT).show()
+            }
             "Clear" -> {
                 val hadSelection = glView.renderer.clearSelectedObjectTransform()
                 glView.requestRender()
@@ -1602,6 +1636,7 @@ class MainActivity : Activity() {
         moveToolBtn = createIconButton(R.drawable.ic_move)
         rotateToolBtn = createIconButton(R.drawable.ic_rotate)
         scaleToolBtn = createIconButton(R.drawable.ic_scale)
+        paintToolBtn = createIconButton(R.drawable.ic_paint)
         // Icono inicial Local (ver default de TransformOrientation en MyGLRenderer) - se actualiza
         // en cada toggle (ver toggleTransformOrientation) para reflejar siempre el estado actual.
         orientationToggleBtn = createIconButton(R.drawable.ic_orientation_local)
@@ -1610,10 +1645,11 @@ class MainActivity : Activity() {
         moveToolBtn.setOnClickListener { setLayoutTool(LayoutTool.MOVE) }
         rotateToolBtn.setOnClickListener { setLayoutTool(LayoutTool.ROTATE) }
         scaleToolBtn.setOnClickListener { setLayoutTool(LayoutTool.SCALE) }
+        paintToolBtn.setOnClickListener { setLayoutTool(LayoutTool.PAINT) }
         orientationToggleBtn.setOnClickListener { toggleTransformOrientation() }
 
         val spacing = (8 * density).toInt()
-        for (btn in listOf(selectToolBtn, moveToolBtn, rotateToolBtn, scaleToolBtn)) {
+        for (btn in listOf(selectToolBtn, moveToolBtn, rotateToolBtn, scaleToolBtn, paintToolBtn)) {
             (btn.layoutParams as LinearLayout.LayoutParams).topMargin = spacing
             column.addView(btn)
         }
@@ -1634,7 +1670,7 @@ class MainActivity : Activity() {
      * hay gizmo dibujado), oculto con Select (no habria nada en pantalla que el boton afecte).
      */
     private fun updateOrientationToggleVisibility() {
-        orientationToggleBtn.visibility = if (currentLayoutTool == LayoutTool.SELECT) View.GONE else View.VISIBLE
+        orientationToggleBtn.visibility = if (currentLayoutTool == LayoutTool.SELECT || currentLayoutTool == LayoutTool.PAINT) View.GONE else View.VISIBLE
     }
 
     /**
@@ -1997,6 +2033,8 @@ class MainActivity : Activity() {
             else -> null
         }
         currentLayoutTool = tool
+        // Con Paint se oculta la grilla del piso para que no estorbe sobre el modelo.
+        glView.renderer.showGrid = (tool != LayoutTool.PAINT)
         updateOrientationToggleVisibility()
         updateLayoutToolHighlight()
         // Move/Rotate/Scale ya funcionan via onViewportDragMove/glView.onDragMove (libre, o
@@ -2009,6 +2047,7 @@ class MainActivity : Activity() {
         moveToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.MOVE)
         rotateToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.ROTATE)
         scaleToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.SCALE)
+        paintToolBtn.background = circleBackground(currentLayoutTool == LayoutTool.PAINT)
     }
 
     /**
@@ -2080,6 +2119,11 @@ class MainActivity : Activity() {
             return
         }
         if (currentMode != AppMode.LAYOUT) return
+        if (currentLayoutTool == LayoutTool.PAINT) {
+            // Paint: el toque pinta en el hilo de render (usa OpenGL), ver MyGLRenderer.paintStart.
+            glView.queueEvent { glView.renderer.paintStart(x, y) }
+            return
+        }
         if (currentLayoutTool == LayoutTool.MOVE || currentLayoutTool == LayoutTool.ROTATE || currentLayoutTool == LayoutTool.SCALE) {
             if (glView.renderer.sceneObjects.any { it.selected }) {
                 glView.renderer.pushUndoSnapshot()
@@ -2257,6 +2301,11 @@ class MainActivity : Activity() {
             return false
         }
         if (currentMode != AppMode.LAYOUT) return false
+        if (currentLayoutTool == LayoutTool.PAINT) {
+            // Paint: el arrastre pinta y NO rota la camara (devolver true consume el gesto, ver MyGLSurfaceView).
+            glView.queueEvent { glView.renderer.paintMove(x, y) }
+            return true
+        }
         return when (currentLayoutTool) {
             LayoutTool.MOVE -> {
                 val axis = axisLocked
@@ -2317,6 +2366,41 @@ class MainActivity : Activity() {
         layoutTab.background = circleBackground(currentMode == AppMode.LAYOUT)
         modelingTab.background = circleBackground(currentMode == AppMode.MODELING)
         uvEditingTab.background = circleBackground(currentMode == AppMode.UV_EDITING)
+    }
+
+    /**
+     * Popup de General/Data (ver charla con el usuario): mismo patron que showFileMenu (icono
+     * propio resaltado mientras esta abierto, PopupWindow con fondo redondeado), pero el
+     * contenido por ahora es solo "Proximamente" (reusa renderPendingSubmenu) - todavia no hay
+     * Outliner ni tabs de Properties implementados. onBack cierra el popup directo en vez de
+     * volver a una lista de categorias (no hay "adentro" al que volver todavia).
+     */
+    private fun showGeneralOrDataMenu(anchor: View, label: String) {
+        val density = resources.displayMetrics.density
+        val menuColumn = LinearLayout(this)
+        menuColumn.orientation = LinearLayout.VERTICAL
+        menuColumn.background = menuBackground()
+        val vPad = (6 * density).toInt()
+        menuColumn.setPadding(vPad, vPad, vPad, vPad)
+
+        val targetButton = if (label == "General") generalButton else dataButton
+        targetButton.background = circleBackground(true)
+
+        val popup = PopupWindow(
+            menuColumn,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            true
+        )
+        popup.isOutsideTouchable = true
+        popup.elevation = 12 * density
+        popup.setOnDismissListener {
+            targetButton.background = circleBackground(false)
+        }
+
+        menuColumn.addView(buildSimpleMenuRow("Próximamente") { })
+
+        popup.showAsDropDown(anchor, 0, (8 * density).toInt())
     }
 
     private fun showFileMenu(anchor: View) {
@@ -2398,7 +2482,29 @@ class MainActivity : Activity() {
         return row
     }
 
+    /**
+     * File > New/Save (ver MyGLRenderer.newProject/saveProjectToFile - un solo slot fijo, con
+     * auto-carga al abrir la app, ver charla con el usuario): Import/Export siguen cayendo al
+     * fallback Toast de abajo a proposito (dependen de un parser/exportador de formato externo,
+     * fuera de alcance por ahora - ver esa misma charla).
+     */
     private fun onFileMenuAction(action: String) {
+        if (action == "New") {
+            glView.renderer.newProject()
+            onViewportDragEnd()
+            glView.requestRender()
+            Toast.makeText(this, "Nuevo proyecto", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (action == "Save") {
+            val saved = glView.renderer.saveProjectToFile()
+            Toast.makeText(this, if (saved) "Proyecto guardado" else "No se pudo guardar", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (action == "Import") {
+            openObjPicker()
+            return
+        }
         // TODO: reemplazar por la logica real de New/Save/Import/Export una vez definido el formato de proyecto.
         Toast.makeText(this, action, Toast.LENGTH_SHORT).show()
     }
@@ -2537,6 +2643,36 @@ class MainActivity : Activity() {
         if (diff > 180f) diff -= 360f
         if (diff < -180f) diff += 360f
         return diff
+    }
+
+    /** File > Import: abre el selector de archivos del sistema para elegir un .obj (ver onActivityResult). */
+    private fun openObjPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.type = "*/*"
+        startActivityForResult(intent, REQ_IMPORT_OBJ)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_IMPORT_OBJ || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        Toast.makeText(this, "Importando...", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val stream = contentResolver.openInputStream(uri) ?: throw IllegalArgumentException("No se pudo abrir el archivo")
+                val mesh = stream.use { ObjLoader.load(it, 1f) }
+                runOnUiThread {
+                    glView.renderer.addImportedMesh(mesh)
+                    glView.requestRender()
+                    val uvInfo = if (mesh.hasUvs) "con UVs" else "SIN UVs"
+                    Toast.makeText(this, "Importado: " + mesh.triangleCount + " triangulos, " + uvInfo, Toast.LENGTH_LONG).show()
+                }
+            } catch (ex: Exception) {
+                runOnUiThread { Toast.makeText(this, "Error al importar: " + ex.message, Toast.LENGTH_LONG).show() }
+            }
+        }.start()
     }
 
     override fun onPause() {

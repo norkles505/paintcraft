@@ -7,6 +7,8 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.sqrt
+import android.content.Context
+import java.io.File
 
 /**
  * Orientacion del gizmo de transformacion activo (Move/Rotate/Scale) - selector tipo Blender
@@ -31,7 +33,7 @@ import kotlin.math.sqrt
  */
 enum class TransformOrientation { GLOBAL, LOCAL }
 
-class MyGLRenderer : GLSurfaceView.Renderer {
+class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private lateinit var cubeGeometry: Cube
     private lateinit var planeGeometry: Plane
@@ -66,6 +68,9 @@ class MyGLRenderer : GLSurfaceView.Renderer {
      * los recrearia 60 veces por segundo (ver comentario de DynamicMeshGeometry.update).
      */
     private val dynamicGeometries = mutableMapOf<Int, DynamicMeshGeometry>()
+
+    /** Geometria con textura de los modelos importados (ver addImportedMesh), por id de objeto. Se crea en onDrawFrame (hilo de render). */
+    private val importedGeometries = mutableMapOf<ObjMesh, TexturedMeshGeometry>()
     // Ids de SceneObject cuya geometria dinamica quedo desactualizada y falta reconstruir de verdad
     // (ver refreshDynamicGeometry / processPendingDynamicGeometryRefreshes). Existe porque
     // enterEditModeForSelected/undo/redo se llaman desde listeners de botones de MainActivity (hilo
@@ -92,7 +97,8 @@ class MyGLRenderer : GLSurfaceView.Renderer {
     fun enterEditModeForSelected(): Boolean {
         val selected = sceneObjects.firstOrNull { it.selected } ?: return false
         if (selected.editableMesh == null) {
-            selected.editableMesh = selected.type.toEditableMesh() ?: return false
+            // Un modelo importado (OBJ) todavia no es editable: sin este chequeo se le creaba un cubo editable invisible (su type es CUBE por defecto).
+            selected.editableMesh = (if (selected.importedMesh != null) null else selected.type.toEditableMesh()) ?: return false
         }
         refreshDynamicGeometry(selected)
         return true
@@ -191,6 +197,86 @@ class MyGLRenderer : GLSurfaceView.Renderer {
         sceneObjects.clear()
         sceneObjects.addAll(next)
         for (obj in sceneObjects) refreshDynamicGeometry(obj)
+        return true
+    }
+
+    /**
+     * File > Save/New (ver charla con el usuario, item 1 del roadmap tras cerrar Fase 4): un solo
+     * slot fijo en el storage interno de la app - se sobreescribe entero en cada Save y se carga
+     * solo (ver loadProjectFromFile, llamada desde onSurfaceCreated) al abrir la app. Simplificacion
+     * deliberada, mismo criterio que "un objeto seleccionado a la vez" o "un solo Undo stack": no
+     * hay todavia ningun sistema de dialogos de archivos (listar/elegir/nombrar) en la app, asi que
+     * multi-proyecto queda para mas adelante si hace falta.
+     */
+    private val projectFile: File
+        get() = File(context.filesDir, "current_project.json")
+
+    /** Carpeta de los binarios de mallas importadas (OBJ) del proyecto guardado (ver ProjectSerializer.writeObjMesh). */
+    private val meshDir: File
+        get() = File(context.filesDir, "imported_meshes")
+
+    /**
+     * Escribe la escena completa (ver sceneObjectsToJson) al slot fijo, pisando lo que hubiera.
+     * Devuelve false (sin lanzar) si algo sale mal (IO, permisos) - el llamador (MainActivity)
+     * usa esto para avisar con un Toast, mismo criterio que el resto de las acciones que pueden
+     * fallar silenciosamente en la app.
+     */
+    fun saveProjectToFile(): Boolean {
+        return try {
+            projectFile.writeText(sceneObjectsToJson(sceneObjects, nextObjectId, meshDir))
+            cleanupImportedMeshFiles(meshDir, sceneObjects)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Auto-carga (ver onSurfaceCreated, se llama despues de dejar la escena default de un cubo ya
+     * armada) - si existe un slot guardado y parsea bien (ver jsonToSceneObjects), reemplaza esa
+     * escena default por la guardada. Si el archivo no existe (primera vez que se abre la app) o
+     * esta corrupto, no hace nada y la escena default de un cubo queda como esta - mismo criterio
+     * de "fallar en silencio hacia un estado usable" que el resto de la app.
+     *
+     * nextObjectId se recalcula como el maximo entre el guardado y (mayor id existente + 1) - a
+     * prueba de un archivo viejo/editado a mano donde ese contador haya quedado desincronizado de
+     * los objetos reales, para que un objeto nuevo despues de cargar nunca choque id con uno ya
+     * cargado.
+     *
+     * dynamicGeometries se limpia y se reencola CADA objeto cargado con editableMesh para
+     * reconstruir su geometria de dibujo (ver refreshDynamicGeometry/pendingDynamicGeometryRefresh)
+     * - esta funcion corre en el hilo de render (onSurfaceCreated), asi que encolar y dejar que
+     * onDrawFrame vacie la cola en su primer frame es seguro, mismo patron que undo()/redo().
+     */
+    private fun loadProjectFromFile(): Boolean {
+        if (!projectFile.exists()) return false
+        val json = try { projectFile.readText() } catch (e: Exception) { return false }
+        val parsed = jsonToSceneObjects(json, meshDir) ?: return false
+        val (loadedObjects, loadedNextId) = parsed
+
+        sceneObjects.clear()
+        sceneObjects.addAll(loadedObjects)
+        nextObjectId = maxOf(loadedNextId, (loadedObjects.maxOfOrNull { it.id } ?: -1) + 1)
+
+        dynamicGeometries.clear()
+        for (obj in sceneObjects) refreshDynamicGeometry(obj)
+        return true
+    }
+
+    /**
+     * File > New: vuelve a la escena inicial de un solo cubo (mismo estado que onSurfaceCreated
+     * al abrir la app por primera vez), pasando por Undo primero (mismo criterio que Delete/
+     * Duplicate/Add: cualquier accion que borre estado del usuario se puede deshacer) - asi un New
+     * accidental no es irreversible mientras no se haya cerrado la app. A proposito NO borra el
+     * archivo del slot guardado (ver projectFile) - New solo afecta la escena en memoria; el
+     * usuario decide si quiere Save despues para que ese vaciado tambien quede guardado.
+     */
+    fun newProject(): Boolean {
+        pushUndoSnapshot()
+        sceneObjects.clear()
+        dynamicGeometries.clear()
+        nextObjectId = 0
+        sceneObjects.add(SceneObject(id = nextObjectId++, selected = true))
         return true
     }
 
@@ -325,6 +411,15 @@ class MyGLRenderer : GLSurfaceView.Renderer {
         return newObject
     }
 
+    /** Agrega un modelo importado desde OBJ (ver ObjLoader) como objeto nuevo, ya seleccionado. */
+    fun addImportedMesh(mesh: ObjMesh): SceneObject {
+        pushUndoSnapshot()
+        for (obj in sceneObjects) obj.selected = false
+        val newObject = SceneObject(id = nextObjectId++, selected = true, importedMesh = mesh)
+        sceneObjects.add(newObject)
+        return newObject
+    }
+
     fun addPlane(): SceneObject {
         pushUndoSnapshot()
         for (obj in sceneObjects) obj.selected = false
@@ -406,6 +501,129 @@ class MyGLRenderer : GLSurfaceView.Renderer {
      * como el resto de las acciones que modifican la escena (Delete/Duplicate/Add).
      * Devuelve false (y no hace nada) si no hay ningun objeto seleccionado.
      */
+    /**
+     * Object > Apply (Layout, ver charla con el usuario: solo "Apply All Transforms" tiene
+     * sentido como accion unica sin pedir mas contexto, mismo criterio ya aplicado en Clear -
+     * en Blender real Apply es un submenu con Location/Rotation/Scale/All por separado).
+     *
+     * A diferencia de Clear (que resetea el transform y listo, moviendo visualmente el objeto de
+     * vuelta al origen), Apply mantiene la posicion/forma visual intacta: "hornea" la
+     * posicion/rotacion/escala actuales DENTRO de los datos de vertices, y recien despues resetea
+     * el transform del objeto a identidad - el objeto queda exactamente donde estaba, pero su
+     * origen y ejes locales vuelven a alinearse con el mundo (mismo comportamiento que Blender:
+     * mover/rotar/escalar despues de un Apply ya no arrastra la escala vieja, por ejemplo).
+     *
+     * Si el objeto todavia no entro nunca a Edit Mode (editableMesh == null), genera su malla
+     * real primero (selected.type.toEditableMesh(), mismo mecanismo que enterEditModeForSelected)
+     * - Apply necesita datos de vertices concretos para hornear el transform adentro, no alcanza
+     * con la primitiva estatica. Si el tipo no tiene malla editable todavia (ninguna primitiva
+     * sin implementar por ahora), devuelve false sin tocar nada.
+     */
+    fun applySelectedObjectTransform(): Boolean {
+        val selected = sceneObjects.firstOrNull { it.selected } ?: return false
+        val mesh = selected.editableMesh ?: selected.type.toEditableMesh() ?: return false
+
+        pushUndoSnapshot()
+
+        val modelMatrix = objectModelMatrix(selected)
+        for (v in mesh.vertices) {
+            val world = localVertexToWorld(modelMatrix, v)
+            v.x = world[0]
+            v.y = world[1]
+            v.z = world[2]
+        }
+
+        selected.editableMesh = mesh
+        selected.posX = 0f
+        selected.posY = 0f
+        selected.posZ = 0f
+        Matrix.setIdentityM(selected.rotationMatrix, 0)
+        Matrix.setIdentityM(selected.shapeMatrix, 0)
+        refreshDynamicGeometry(selected)
+        return true
+    }
+
+    /**
+     * Object > Set Origin (Layout, mismo criterio de simplificación que Apply: en Blender real es
+     * un submenú con 3 opciones - Origin to Geometry/3D Cursor/Center of Mass - acá una sola
+     * acción directa, equivalente a "Origin to Geometry" (Median Point), ya que 3D Cursor está
+     * fuera de alcance y Center of Mass no aporta diferencia real sin simulación de física.
+     *
+     * Mueve el ORIGEN del objeto (posX/Y/Z) al centro geométrico (promedio simple de vértices en
+     * espacio local, "Median Point" - no bounding box) SIN mover la malla visualmente: desplaza
+     * los vértices en espacio local la distancia opuesta, y compensa la posición del objeto con el
+     * mismo offset ya rotado/escalado a espacio mundo (rotationMatrix * shapeMatrix), para que el
+     * resultado visual sea idéntico y solo cambien el pivote y los ejes locales del gizmo.
+     *
+     * Mismo mecanismo que Apply para generar la malla real primero si el objeto nunca entró a
+     * Edit Mode. Devuelve false si no hay selección o la malla no tiene vértices (nada para
+     * promediar).
+     */
+    fun setOriginToGeometrySelected(): Boolean {
+        val selected = sceneObjects.firstOrNull { it.selected } ?: return false
+        val mesh = selected.editableMesh ?: selected.type.toEditableMesh() ?: return false
+        if (mesh.vertices.isEmpty()) return false
+
+        pushUndoSnapshot()
+
+        var cx = 0f
+        var cy = 0f
+        var cz = 0f
+        for (v in mesh.vertices) {
+            cx += v.x
+            cy += v.y
+            cz += v.z
+        }
+        val n = mesh.vertices.size
+        cx /= n
+        cy /= n
+        cz /= n
+
+        for (v in mesh.vertices) {
+            v.x -= cx
+            v.y -= cy
+            v.z -= cz
+        }
+
+        val rotScale = FloatArray(16)
+        Matrix.multiplyMM(rotScale, 0, selected.rotationMatrix, 0, selected.shapeMatrix, 0)
+        val worldOffset = FloatArray(4)
+        Matrix.multiplyMV(worldOffset, 0, rotScale, 0, floatArrayOf(cx, cy, cz, 0f), 0)
+        selected.posX += worldOffset[0]
+        selected.posY += worldOffset[1]
+        selected.posZ += worldOffset[2]
+
+        selected.editableMesh = mesh
+        refreshDynamicGeometry(selected)
+        return true
+    }
+
+    /**
+     * Object > Show/Hide (Layout, ver charla con el usuario - acción única en vez del H/Alt+H/
+     * Shift+H de Blender): toggle simple. Si hay un objeto seleccionado, lo oculta (deja de
+     * dibujarse - ver onDrawFrame - y de ser alcanzable por raycast - ver selectObjectAt) y lo
+     * deselecciona (un objeto oculto no puede quedar "seleccionado", mismo criterio que Blender).
+     * Si no hay ninguno seleccionado pero existe al menos un objeto oculto, los muestra TODOS de
+     * nuevo (equivalente simplificado de Alt+H - sin el Shift+H de "ocultar todo lo no
+     * seleccionado", que no aporta con el modelo actual de un solo objeto seleccionado a la vez).
+     * Devuelve false si no hay nada para hacer (nada seleccionado y nada oculto).
+     */
+    fun toggleShowHideSelected(): Boolean {
+        val selected = sceneObjects.firstOrNull { it.selected }
+        if (selected != null) {
+            pushUndoSnapshot()
+            selected.visible = false
+            selected.selected = false
+            return true
+        }
+        if (sceneObjects.any { !it.visible }) {
+            pushUndoSnapshot()
+            for (obj in sceneObjects) obj.visible = true
+            return true
+        }
+        return false
+    }
+
     fun clearSelectedObjectTransform(): Boolean {
         val selected = sceneObjects.firstOrNull { it.selected } ?: return false
         pushUndoSnapshot()
@@ -1007,6 +1225,17 @@ class MyGLRenderer : GLSurfaceView.Renderer {
         gridXZ = Grid(GridPlane.XZ)
         gridYZ = Grid(GridPlane.YZ)
         gizmo = Gizmo3D()
+        importedGeometries.clear()
+        // Contexto GL recreado (por ejemplo al volver del selector de archivos): la escena ya existe en memoria, no se recarga ni se reinicia.
+        if (sceneObjects.isNotEmpty()) return
+
+        // File > auto-load (ver loadProjectFromFile): al recrearse la superficie GL, intenta
+        // cargar el slot guardado ANTES de armar la escena default de un cubo - si hay algo
+        // guardado, esta funcion ya deja sceneObjects poblado y el resto de este metodo (mas
+        // abajo) se saltea via el return de abajo, para no pisar lo recien cargado con el cubo
+        // default. Si no hay nada guardado, sceneObjects sigue vacio aca (todavia no se toco) y
+        // el flujo sigue de largo hacia la creacion del cubo default de siempre.
+        if (loadProjectFromFile()) return
 
         sceneObjects.clear()
         sceneObjects.add(SceneObject(id = nextObjectId++, selected = true))
@@ -1055,7 +1284,7 @@ class MyGLRenderer : GLSurfaceView.Renderer {
             'Y' -> gridXZ
             else -> gridXY
         }
-        grid.draw(mvpMatrix)
+        if (showGrid) grid.draw(mvpMatrix)
 
         // Cada objeto se dibuja con su propia matriz (mvpMatrix comun de camara + transform propia:
         // traslacion, rotacion acumulada (obj.rotationMatrix, ver SceneObject) y forma (obj.shapeMatrix,
@@ -1065,12 +1294,27 @@ class MyGLRenderer : GLSurfaceView.Renderer {
         val modelMatrix = FloatArray(16)
         val shapedModelMatrix = FloatArray(16)
         val objMvpMatrix = FloatArray(16)
+        // Normales de modelos importados en espacio de vista (ver TexturedMeshGeometry): vista * rotacion de camara * rotacion del objeto.
+        val viewRotationMatrix = FloatArray(16)
+        Matrix.multiplyMM(viewRotationMatrix, 0, viewMatrix, 0, rotationMatrix, 0)
+        val importedNormalMatrix = FloatArray(16)
         for (obj in sceneObjects) {
+            // Object > Show/Hide (ver toggleShowHideSelected): un objeto oculto no se dibuja,
+            // mismo criterio que Blender (deja de existir visualmente hasta volver a mostrarlo).
+            if (!obj.visible) continue
             Matrix.setIdentityM(translateMatrix, 0)
             Matrix.translateM(translateMatrix, 0, obj.posX, obj.posY, obj.posZ)
             Matrix.multiplyMM(modelMatrix, 0, translateMatrix, 0, obj.rotationMatrix, 0)
             Matrix.multiplyMM(shapedModelMatrix, 0, modelMatrix, 0, obj.shapeMatrix, 0)
             Matrix.multiplyMM(objMvpMatrix, 0, mvpMatrix, 0, shapedModelMatrix, 0)
+            // Modelo importado desde OBJ (ver addImportedMesh): su geometria con textura se crea la primera vez que se dibuja
+            // (aca, en el hilo de render) y se reutiliza despues, por id de objeto.
+            val importedMesh = obj.importedMesh
+            if (importedMesh != null) {
+                Matrix.multiplyMM(importedNormalMatrix, 0, viewRotationMatrix, 0, obj.rotationMatrix, 0)
+                importedGeometries.getOrPut(importedMesh) { TexturedMeshGeometry(importedMesh) }.draw(objMvpMatrix, obj.selected, importedNormalMatrix)
+                continue
+            }
             // Si el objeto ya tiene editableMesh (entro a Edit Mode al menos una vez, ver
             // enterEditModeForSelected), dibuja SIEMPRE con su geometria dinamica propia (ver
             // dynamicGeometries/DynamicMeshGeometry.kt) - en Layout o en Modeling, no solo
@@ -1274,6 +1518,74 @@ class MyGLRenderer : GLSurfaceView.Renderer {
         return rayOrigin to rayDir
     }
 
+    // ---- Pintura sobre modelos importados (herramienta Paint, ver MainActivity.LayoutTool.PAINT) ----
+
+    /** false mientras la herramienta Paint esta activa: se oculta la grilla del piso para no estorbar al pintar. */
+    var showGrid: Boolean = true
+
+    /** Pincel de color fijo (RGB) y radio en texeles de la textura - por ahora sin selector de color ni de tamano. */
+    private val paintColor = intArrayOf(225, 70, 60)
+    private val paintRadius = 18f
+    /** Ultimo punto de pantalla del trazo en curso, para rellenar los huecos entre eventos de toque (ver paintMove). */
+    private var lastPaintX = 0f
+    private var lastPaintY = 0f
+
+    /** Empieza un trazo: pinta un toque en (screenX, screenY). IMPORTANTE: llamar desde el hilo de render (glView.queueEvent). */
+    fun paintStart(screenX: Float, screenY: Float) {
+        lastPaintX = screenX
+        lastPaintY = screenY
+        paintAt(screenX, screenY)
+    }
+
+    /**
+     * Continua el trazo hasta (screenX, screenY): rellena el camino desde el ultimo punto con toques cada ~6 px de
+     * pantalla, asi un arrastre rapido no deja un punteado. IMPORTANTE: llamar desde el hilo de render.
+     */
+    fun paintMove(screenX: Float, screenY: Float) {
+        val dx = screenX - lastPaintX
+        val dy = screenY - lastPaintY
+        val dist = kotlin.math.sqrt(dx * dx + dy * dy)
+        val steps = maxOf(1, (dist / 6f).toInt())
+        for (i in 1..steps) {
+            paintAt(lastPaintX + dx * i / steps, lastPaintY + dy * i / steps)
+        }
+        lastPaintX = screenX
+        lastPaintY = screenY
+    }
+
+    /**
+     * Un toque de pincel en un punto de pantalla: convierte el punto en rayo, lo lleva al espacio local de cada modelo
+     * importado visible (inversa de su matriz de modelo), busca el triangulo mas cercano que el rayo atraviesa (ver
+     * TexturedMeshGeometry.pickUv) y pinta ahi, en la textura de ese modelo. Ignora los modelos que todavia no se
+     * dibujaron ni una vez (su geometria con textura se crea en el primer frame, ver onDrawFrame).
+     */
+    private fun paintAt(screenX: Float, screenY: Float) {
+        val (rayOrigin, rayDir) = screenPointToRay(screenX, screenY) ?: return
+        var bestT = Float.MAX_VALUE
+        var bestGeo: TexturedMeshGeometry? = null
+        var bestU = 0f
+        var bestV = 0f
+        for (obj in sceneObjects) {
+            if (!obj.visible) continue
+            val mesh = obj.importedMesh ?: continue
+            val geo = importedGeometries[mesh] ?: continue
+            val inv = FloatArray(16)
+            if (!Matrix.invertM(inv, 0, objectModelMatrix(obj), 0)) continue
+            val o = FloatArray(4)
+            val d = FloatArray(4)
+            Matrix.multiplyMV(o, 0, inv, 0, floatArrayOf(rayOrigin[0], rayOrigin[1], rayOrigin[2], 1f), 0)
+            Matrix.multiplyMV(d, 0, inv, 0, floatArrayOf(rayDir[0], rayDir[1], rayDir[2], 0f), 0)
+            val hit = geo.pickUv(o[0], o[1], o[2], d[0], d[1], d[2]) ?: continue
+            if (hit[0] < bestT) {
+                bestT = hit[0]
+                bestGeo = geo
+                bestU = hit[1]
+                bestV = hit[2]
+            }
+        }
+        bestGeo?.paintDab(bestU, bestV, paintRadius, paintColor[0], paintColor[1], paintColor[2])
+    }
+
     /**
      * Deselecciona todos los objetos (Layout > Select > None) - mismo criterio que selectObjectAt
      * tocando espacio vacio. No pasa por Undo (igual que selectObjectAt/hitTestGizmoRotateAxis):
@@ -1294,6 +1606,7 @@ class MyGLRenderer : GLSurfaceView.Renderer {
         var hitObject: SceneObject? = null
         var closestT = Float.MAX_VALUE
         for (obj in sceneObjects) {
+            if (!obj.visible) continue
             val t = intersectAABB(rayOrigin, rayDir, obj.posX, obj.posY, obj.posZ, obj.shapeMatrix)
             if (t != null && t < closestT) {
                 closestT = t

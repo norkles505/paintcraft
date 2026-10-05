@@ -7,7 +7,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="MeshCraft"
+        android:label="PaintCraft"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
         <activity
             android:name=".MainActivity"
