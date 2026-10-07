@@ -1,0 +1,17 @@
+reserva tracked: 71
+last commit: 5d74a63 2026-10-05 cosas
+Cube tracked: 1
+Torus tracked: 1
+Monkey tracked: 1
+Gizmo3D tracked: 1
+GizmoLabelView tracked: 1
+Plane tracked: 1
+Circle tracked: 1
+Cone tracked: 1
+Cylinder tracked: 1
+IcoSphere tracked: 1
+UvSphere tracked: 1
+Grid tracked: 1
+GridMesh tracked: 1
+MeshGeometry tracked: 1
+PngWriter tracked: 0

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Invertir color de la capa -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <!-- Circulo (centro 320.6, 320.7; radio 256.94) -->
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="40"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M63.65,320.7a256.94,256.94 0 1,0 513.88,0a256.94,256.94 0 1,0 -513.88,0" />
+    <!-- Diagonal -->
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="40"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M150.27419,132.8647L491.67152,509.37351" />
+    <!-- Mitad rellena -->
+    <path
+        android:fillColor="#000000"
+        android:strokeColor="#000000"
+        android:strokeWidth="47.1455"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 188.87938,124.55535 c 42.18104,-27.948333 88.59923,-41.12701 139.00295,-39.46458 30.22511,0.996908 53.0724,5.722634 80.75027,16.70237 101.65017,40.3243 162.02728,146.30064 145.17718,254.82088 -6.49044,41.80053 -23.91788,81.29048 -49.80138,112.84819 -3.11703,3.80034 -6.5891,8.06457 -7.71566,9.47605 l -2.04829,2.56632 L 335.92126,306.89845 C 209.74962,167.7505 177.83527,132.10853 178.7662,131.38721 c 0.64248,-0.49778 5.19339,-3.57215 10.11315,-6.83191 z" />
+</vector>

@@ -2,11 +2,13 @@ package com.meshcraft.app
 
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -19,41 +21,26 @@ import android.widget.TextView
 import android.widget.Toast
 
 private const val REQ_IMPORT_OBJ = 4101
+private const val REQ_EXPORT_PNG = 4102
 
 /**
- * Pantalla unica de la app de pintura: vista 3D (un dedo pinta, dos dedos mueven la camara), panel de pintura abajo,
- * columna de botones a la derecha (zoom, mano, candado, deshacer/rehacer), menu File arriba a la izquierda y menu de
- * puntos de vista (Top, Front...) arriba al centro.
+ * Pantalla unica de la app de pintura: vista 3D (un dedo pinta, dos dedos mueven la camara y el pellizco hace zoom),
+ * panel de pintura abajo (su panel de herramientas trae tambien mano y bloqueo de la camara, ver PaintPanel) y arriba
+ * a la izquierda el menu File con los botones de deshacer/rehacer trazos.
+ * Los puntos de vista (Top, Front...) se eligen con el gizmo de ejes de arriba a la derecha.
  */
 class MainActivity : Activity() {
 
     private lateinit var glView: MyGLSurfaceView
     private lateinit var gizmoView: GizmoView
 
-    private lateinit var handButton: ImageView
-    private lateinit var lockButton: ImageView
-
     private lateinit var fileButton: ImageView
-    private lateinit var layoutTab: ImageView
 
-    private lateinit var rightToolColumn: LinearLayout
     private lateinit var paintPanel: PaintPanel
 
-    /** true mientras el panel de color de PaintPanel esta abierto (ver PaintPanel.onColorPanelVisible). */
-    private var colorPanelOpen = false
-
-    private var viewMenuPopup: PopupWindow? = null
-
-    /** Puntos de vista: reutilizan los mismos angulos que el gizmo de ejes (ver GizmoView / animateCameraTo). */
-    private data class ViewpointOption(val label: String, val angleX: Float, val angleY: Float)
-    private val viewpointOptions = listOf(
-        ViewpointOption("Top", 90f, 0f),
-        ViewpointOption("Bottom", -90f, 0f),
-        ViewpointOption("Front", 0f, 0f),
-        ViewpointOption("Back", 0f, 180f),
-        ViewpointOption("Right", 0f, -90f),
-        ViewpointOption("Left", 0f, 90f)
-    )
+    /** Lo que se esta exportando mientras el selector de archivos elige el destino (ver startExport / finishExport), y la capa si es una sola. */
+    private var pendingExport: ExportKind? = null
+    private var pendingExportLayerId = -1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,16 +74,6 @@ class MainActivity : Activity() {
         gizmoParams.rightMargin = margin
         root.addView(gizmoView, gizmoParams)
 
-        rightToolColumn = buildToolButtonColumn()
-        root.addView(rightToolColumn, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.END
-            rightMargin = margin
-            bottomMargin = margin
-        })
-
         root.addView(buildTopBar(), FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
@@ -107,14 +84,17 @@ class MainActivity : Activity() {
 
         // Panel de pintura (estilo ibisPaint): se agrega al final para quedar encima de todo. Siempre visible (con su triangulo para ocultarlo).
         paintPanel = PaintPanel(this, glView.renderer)
-        // Con el panel de color abierto se esconde la columna de botones de la derecha; al cerrarlo vuelve.
-        paintPanel.onColorPanelVisible = { open ->
-            colorPanelOpen = open
-            updateSideColumnsVisibility()
+        // Mano y Bloqueo viven en el panel de herramientas de PaintPanel; la camara se controla desde aqui.
+        // Cada callback devuelve true si el boton debe quedar resaltado (modo desplazar / camara bloqueada).
+        paintPanel.onHandToggle = {
+            val toPan = glView.touchMode == TouchMode.ROTATE
+            glView.touchMode = if (toPan) TouchMode.PAN else TouchMode.ROTATE
+            toPan
         }
-        // El panel cambia de alto al abrir/cerrar sus paneles desplegables: la columna de la derecha se acomoda despues de cada layout.
-        paintPanel.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
-            if (bottom - top != oldBottom - oldTop) paintPanel.post { updateRightColumnInset() }
+        paintPanel.onLockToggle = {
+            val locked = !glView.isLocked
+            glView.isLocked = locked
+            locked
         }
         root.addView(paintPanel, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -127,9 +107,9 @@ class MainActivity : Activity() {
         })
 
         setContentView(root)
-        updateRightColumnInset()
     }
 
+    /** Barra de arriba: File en la esquina y, a su lado, deshacer y rehacer trazos. */
     private fun buildTopBar(): FrameLayout {
         val density = resources.displayMetrics.density
         val margin = (16 * density).toInt()
@@ -146,58 +126,55 @@ class MainActivity : Activity() {
         fileParams.leftMargin = margin
         bar.addView(fileButton, fileParams)
 
-        // Layout: boton centrado que abre la lista de puntos de vista.
-        layoutTab = createIconButton(R.drawable.ic_layout)
-        layoutTab.setOnClickListener { toggleViewMenu(layoutTab) }
-        layoutTab.background = circleBackground(true)
-
-        val tabsParams = FrameLayout.LayoutParams(
+        // Deshacer/Rehacer a la derecha de File (el gizmo queda en la esquina opuesta, sin chocar).
+        val undoRedoParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         )
-        tabsParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        bar.addView(layoutTab, tabsParams)
+        undoRedoParams.gravity = Gravity.TOP or Gravity.START
+        undoRedoParams.leftMargin = margin + fileButton.layoutParams.width + (8 * density).toInt()
+        bar.addView(buildUndoRedoRow(), undoRedoParams)
 
         return bar
     }
 
-    private fun toggleViewMenu(anchor: View) {
-        val existing = viewMenuPopup
-        if (existing != null && existing.isShowing) {
-            existing.dismiss()
-            return
-        }
-        showViewMenu(anchor)
-    }
-
-    /** Menu de los 6 puntos de vista (Top, Bottom, Front, Back, Right, Left) - reusan animateCameraTo, igual que el gizmo de ejes. */
-    private fun showViewMenu(anchor: View) {
+    /**
+     * Fila con Deshacer y Rehacer de trazos de pintura (ver MyGLRenderer.undo/redo). Restaurar pixeles usa OpenGL, asi que se hace en
+     * el hilo de render y el resultado (redibujar o avisar que no hay nada) vuelve al hilo de la interfaz.
+     */
+    private fun buildUndoRedoRow(): LinearLayout {
         val density = resources.displayMetrics.density
-        val menuColumn = LinearLayout(this)
-        menuColumn.orientation = LinearLayout.VERTICAL
-        menuColumn.background = menuBackground()
-        val vPad = (6 * density).toInt()
-        menuColumn.setPadding(vPad, vPad, vPad, vPad)
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
 
-        val popup = PopupWindow(
-            menuColumn,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            true
-        )
-        popup.isOutsideTouchable = true
-        popup.elevation = 12 * density
-        popup.setOnDismissListener { viewMenuPopup = null }
+        val undoBtn = createIconButton(R.drawable.ic_undo)
+        val redoBtn = createIconButton(R.drawable.ic_redo)
 
-        for (option in viewpointOptions) {
-            menuColumn.addView(buildSimpleMenuRow(option.label) {
-                popup.dismiss()
-                animateCameraTo(option.angleX, option.angleY)
-            })
+        undoBtn.setOnClickListener {
+            glView.queueEvent {
+                val done = glView.renderer.undo()
+                runOnUiThread {
+                    if (done) glView.requestRender()
+                    else Toast.makeText(this, "Nada para deshacer", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        redoBtn.setOnClickListener {
+            glView.queueEvent {
+                val done = glView.renderer.redo()
+                runOnUiThread {
+                    if (done) glView.requestRender()
+                    else Toast.makeText(this, "Nada para rehacer", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
-        viewMenuPopup = popup
-        popup.showAsDropDown(anchor, 0, (8 * density).toInt())
+        val spacing = (8 * density).toInt()
+        for ((i, btn) in listOf(undoBtn, redoBtn).withIndex()) {
+            if (i > 0) (btn.layoutParams as LinearLayout.LayoutParams).leftMargin = spacing
+            row.addView(btn)
+        }
+        return row
     }
 
     /** Fila de menu con icono + texto, usada por el menu File. */
@@ -232,31 +209,6 @@ class MainActivity : Activity() {
         )
         textParams.leftMargin = (10 * density).toInt()
         text.layoutParams = textParams
-        row.addView(text)
-
-        row.setOnClickListener { onClick() }
-        return row
-    }
-
-    private fun buildSimpleMenuRow(label: String, onClick: () -> Unit): LinearLayout {
-        val density = resources.displayMetrics.density
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.gravity = Gravity.CENTER_VERTICAL
-        val hPad = (12 * density).toInt()
-        val vPad = (10 * density).toInt()
-        row.setPadding(hPad, vPad, hPad, vPad)
-        row.isClickable = true
-        row.background = menuItemPressBackground()
-        row.layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        )
-
-        val text = TextView(this)
-        text.text = label
-        text.setTextColor(Color.WHITE)
-        text.textSize = 14f
         row.addView(text)
 
         row.setOnClickListener { onClick() }
@@ -306,8 +258,8 @@ class MainActivity : Activity() {
     }
 
     /**
-     * File > New/Save/Import (ver MyGLRenderer.newProject/saveProjectToFile - un solo slot fijo,
-     * con auto-carga al abrir la app). Export (sacar la textura pintada) todavia es un Toast.
+     * File > New/Save/Import (ver MyGLRenderer.newProject/saveProjectToFile - un solo slot fijo, con auto-carga al abrir
+     * la app) y Export (sacar la textura pintada como PNG, ver showExportDialog).
      */
     private fun onFileMenuAction(action: String) {
         if (action == "New") {
@@ -317,16 +269,96 @@ class MainActivity : Activity() {
             return
         }
         if (action == "Save") {
-            val saved = glView.renderer.saveProjectToFile()
-            Toast.makeText(this, if (saved) "Proyecto guardado" else "No se pudo guardar", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Guardando...", Toast.LENGTH_SHORT).show()
+            // Escribir las capas puede tardar (hasta unos 40 MB): va en un hilo aparte para no congelar la interfaz.
+            Thread {
+                val saved = glView.renderer.saveProjectToFile()
+                runOnUiThread {
+                    Toast.makeText(this, if (saved) "Proyecto guardado" else "No se pudo guardar", Toast.LENGTH_SHORT).show()
+                }
+            }.start()
             return
         }
         if (action == "Import") {
             openObjPicker()
             return
         }
-        // TODO: Export de la textura pintada.
-        Toast.makeText(this, action, Toast.LENGTH_SHORT).show()
+        // Export: elige que sacar (ver showExportDialog) y despues el destino (ver startExport).
+        showExportDialog()
+    }
+
+    // ---- Exportar PNG ----
+
+    /** File > Export: pregunta que sacar (textura completa con o sin fondo, o solo la capa elegida). */
+    private fun showExportDialog() {
+        if (glView.renderer.activeGeometry == null) {
+            Toast.makeText(this, "Importa un modelo para poder exportar", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val labels = arrayOf(
+            "Textura completa (con el fondo elegido)",
+            "Textura completa (transparente)",
+            "Solo la capa elegida (transparente)"
+        )
+        val kinds = arrayOf(ExportKind.TEXTURE_WITH_BASE, ExportKind.TEXTURE_TRANSPARENT, ExportKind.LAYER)
+        AlertDialog.Builder(this)
+            .setTitle("Exportar PNG")
+            .setItems(labels) { _, which -> startExport(kinds[which]) }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    /**
+     * Abre el selector de archivos del sistema para elegir donde guardar el PNG (ver onActivityResult / finishExport).
+     * Tambien lo usa LayersPanel para "Guardar capa como PNG" (ExportKind.LAYER).
+     */
+    fun startExport(kind: ExportKind) {
+        val geo = glView.renderer.activeGeometry
+        if (geo == null) {
+            Toast.makeText(this, "Importa un modelo para poder exportar", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // Una carpeta no tiene pixeles propios: se avisa ahora y no despues de elegir el destino (que dejaria un archivo vacio).
+        if (kind == ExportKind.LAYER && geo.selectedLayer()?.isFolder != false) {
+            Toast.makeText(this, "Elige una capa (no una carpeta) para exportarla", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingExport = kind
+        pendingExportLayerId = if (kind == ExportKind.LAYER) geo.selectedLayerId else -1
+        val fileName = if (kind == ExportKind.LAYER) "paintcraft_capa.png" else "paintcraft_textura.png"
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.type = "image/png"
+        intent.putExtra(Intent.EXTRA_TITLE, fileName)
+        startActivityForResult(intent, REQ_EXPORT_PNG)
+    }
+
+    /** Ya hay destino (uri): arma los pixeles y escribe el PNG en un hilo aparte (son 4 MB de pixeles, no se debe congelar la interfaz). */
+    private fun finishExport(uri: Uri) {
+        val kind = pendingExport ?: return
+        val layerId = pendingExportLayerId
+        pendingExport = null
+        pendingExportLayerId = -1
+        val geo = glView.renderer.activeGeometry
+        if (geo == null) {
+            Toast.makeText(this, "No hay modelo para exportar", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(this, "Exportando...", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val rgba = when (kind) {
+                    ExportKind.TEXTURE_WITH_BASE -> geo.exportCompositeRgba(true)
+                    ExportKind.TEXTURE_TRANSPARENT -> geo.exportCompositeRgba(false)
+                    ExportKind.LAYER -> geo.exportLayerRgba(layerId)
+                } ?: throw IllegalStateException("No hay nada que exportar")
+                val stream = contentResolver.openOutputStream(uri) ?: throw IllegalArgumentException("No se pudo abrir el destino")
+                stream.use { PngExport.write(it, geo.texSize, rgba) }
+                runOnUiThread { Toast.makeText(this, "PNG guardado", Toast.LENGTH_SHORT).show() }
+            } catch (ex: Exception) {
+                runOnUiThread { Toast.makeText(this, "Error al exportar: " + ex.message, Toast.LENGTH_LONG).show() }
+            }
+        }.start()
     }
 
     private fun menuBackground(): GradientDrawable {
@@ -353,70 +385,6 @@ class MainActivity : Activity() {
             addState(intArrayOf(android.R.attr.state_pressed), pressed)
             addState(intArrayOf(), normal)
         }
-    }
-
-    private fun buildToolButtonColumn(): LinearLayout {
-        val density = resources.displayMetrics.density
-        val column = LinearLayout(this)
-        column.orientation = LinearLayout.VERTICAL
-
-        val zoomInBtn = createIconButton(R.drawable.ic_zoom_in)
-        val zoomOutBtn = createIconButton(R.drawable.ic_zoom_out)
-        handButton = createIconButton(R.drawable.ic_hand)
-        lockButton = createIconButton(R.drawable.ic_lock_rotation)
-        val undoBtn = createIconButton(R.drawable.ic_undo)
-        val redoBtn = createIconButton(R.drawable.ic_redo)
-
-        zoomInBtn.setOnClickListener { glView.renderer.zoomIn() }
-        zoomOutBtn.setOnClickListener { glView.renderer.zoomOut() }
-
-        handButton.setOnClickListener {
-            glView.touchMode = if (glView.touchMode == TouchMode.ROTATE) TouchMode.PAN else TouchMode.ROTATE
-            handButton.background = circleBackground(glView.touchMode == TouchMode.PAN)
-        }
-
-        lockButton.setOnClickListener {
-            glView.isLocked = !glView.isLocked
-            lockButton.background = circleBackground(glView.isLocked)
-        }
-
-        // Undo/Redo: pila de snapshots de la escena (ver MyGLRenderer.undo/redo). Todavia no cubre los trazos de pintura.
-        undoBtn.setOnClickListener {
-            if (glView.renderer.undo()) {
-                glView.requestRender()
-            } else {
-                Toast.makeText(this, "Nada para deshacer", Toast.LENGTH_SHORT).show()
-            }
-        }
-        redoBtn.setOnClickListener {
-            if (glView.renderer.redo()) {
-                glView.requestRender()
-            } else {
-                Toast.makeText(this, "Nada para rehacer", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        val spacing = (8 * density).toInt()
-        for (btn in listOf(zoomInBtn, zoomOutBtn, handButton, lockButton, undoBtn, redoBtn)) {
-            (btn.layoutParams as LinearLayout.LayoutParams).topMargin = spacing
-            column.addView(btn)
-        }
-
-        return column
-    }
-
-    /** Esconde la columna de botones de la derecha mientras el panel de color esta abierto; al cerrarlo vuelve. */
-    private fun updateSideColumnsVisibility() {
-        rightToolColumn.visibility = if (colorPanelOpen) View.GONE else View.VISIBLE
-    }
-
-    /** Sube la columna de botones de la derecha (zoom, mano, undo...) para que el panel de pintura no la tape. */
-    private fun updateRightColumnInset() {
-        val density = resources.displayMetrics.density
-        val panelDp = if (paintPanel.height > 0) (paintPanel.height / density).toInt() + 8 else 72
-        val lp = rightToolColumn.layoutParams as FrameLayout.LayoutParams
-        lp.bottomMargin = (16 * density).toInt() + (panelDp * density).toInt()
-        rightToolColumn.layoutParams = lp
     }
 
     private fun createIconButton(iconRes: Int): ImageView {
@@ -484,6 +452,17 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_EXPORT_PNG) {
+            // Si cancelo el selector, se olvida lo que estaba pendiente.
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null) {
+                pendingExport = null
+                pendingExportLayerId = -1
+                return
+            }
+            finishExport(uri)
+            return
+        }
         if (requestCode != REQ_IMPORT_OBJ || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         Toast.makeText(this, "Importando...", Toast.LENGTH_SHORT).show()
@@ -503,9 +482,21 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    /**
+     * Autoguardado: al salir de la app (o abrir el selector de archivos) escribe el proyecto en el mismo slot que Save, en un
+     * hilo aparte y sin avisos. Con la escena vacia (por ejemplo despues de File > New) no guarda, para no pisar el ultimo
+     * proyecto guardado con nada. Si coincide con un Save manual, uno espera al otro (ver MyGLRenderer.saveProjectToFile).
+     */
+    private fun autoSave() {
+        val renderer = glView.renderer
+        if (renderer.sceneObjects.isEmpty()) return
+        Thread { renderer.saveProjectToFile() }.start()
+    }
+
     override fun onPause() {
         super.onPause()
         glView.onPause()
+        autoSave()
     }
 
     override fun onResume() {

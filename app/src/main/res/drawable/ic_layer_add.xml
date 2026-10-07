@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Añadir capa (más) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="75"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 315.36681,79.258758 V 564.47752" />
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="75"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 76.210426,322.10991 H 561.42919" />
+</vector>

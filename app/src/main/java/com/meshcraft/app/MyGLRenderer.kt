@@ -11,7 +11,7 @@ import kotlin.math.sqrt
 
 /**
  * Renderer de la app de pintura de texturas: dibuja los modelos importados desde OBJ (ver TexturedMeshGeometry),
- * maneja la camara orbital, el proyecto guardado, el Undo/Redo de la escena y la pintura sobre la textura.
+ * maneja la camara orbital, el proyecto guardado, el Undo/Redo de los trazos de pintura y la pintura sobre la textura.
  * Ya no hay primitivas (cubo, esfera, etc.), gizmos de transformacion ni seleccion de objetos: solo se pinta.
  */
 class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
@@ -24,31 +24,30 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var sceneInitialized = false
 
     /** Geometria con textura de los modelos importados (ver addImportedMesh), por malla. Se crea en onDrawFrame (hilo de render). */
-    private val importedGeometries = mutableMapOf<ObjMesh, TexturedMeshGeometry>()
+    private val importedGeometries = java.util.concurrent.ConcurrentHashMap<ObjMesh, TexturedMeshGeometry>()
 
     /**
-     * Mallas importadas que siguen "vivas" (en la escena o en el historial de Undo/Redo), calculadas en el hilo que
-     * pidio el barrido (ver requestGeometrySweep) y entregadas al hilo de render, que es el unico que puede liberar
-     * recursos de OpenGL (ver sweepImportedGeometries). AtomicReference: se escribe desde la UI y se lee en el render.
+     * Mallas importadas que siguen "vivas" (en la escena), calculadas en el hilo que pidio el barrido (ver
+     * requestGeometrySweep) y entregadas al hilo de render, que es el unico que puede liberar recursos de OpenGL
+     * (ver sweepImportedGeometries). AtomicReference: se escribe desde la UI y se lee en el render.
      */
     private val pendingLiveMeshes = java.util.concurrent.atomic.AtomicReference<Set<ObjMesh>?>(null)
 
     /**
      * Pide liberar la geometria (VBO, textura, shaders) de las mallas importadas que ya no usa nadie. Una malla sigue
-     * viva mientras algun objeto de la escena, o algun snapshot de Undo/Redo, la referencie - asi deshacer una
-     * importacion restaura el modelo con su pintura intacta. No toca OpenGL aca (puede llamarse desde cualquier hilo).
+     * viva mientras algun objeto de la escena la referencie. No toca OpenGL aca (puede llamarse desde cualquier hilo).
      */
     private fun requestGeometrySweep() {
         val live = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<ObjMesh, Boolean>())
         for (obj in sceneObjects.toList()) obj.importedMesh?.let { live.add(it) }
-        for (snapshot in undoStack) for (obj in snapshot) obj.importedMesh?.let { live.add(it) }
-        for (snapshot in redoStack) for (obj in snapshot) obj.importedMesh?.let { live.add(it) }
         pendingLiveMeshes.set(live)
     }
 
     /** Ejecuta el barrido pedido por requestGeometrySweep. SOLO desde el hilo de render (onDrawFrame). */
     private fun sweepImportedGeometries() {
         val live = pendingLiveMeshes.getAndSet(null) ?: return
+        // Las capas pendientes de una malla que ya no esta en la escena no se van a usar: se sueltan.
+        savedLayersByMesh.keys.retainAll(live)
         val iterator = importedGeometries.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
@@ -60,42 +59,62 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     /**
-     * Pilas de Undo/Redo: cada entrada es una foto completa de sceneObjects (deep copy, ver snapshotSceneObjects)
-     * tomada ANTES de que la accion correspondiente modifique el estado real. Limitada a MAX_UNDO_STEPS (FIFO).
-     * Ojo: por ahora solo cubre cambios de la escena (importar, nuevo proyecto); los trazos de pintura no entran.
+     * Historial de Undo/Redo de los trazos de pintura: cada entrada es un StrokeEdit (las baldosas de textura que toco el
+     * trazo, ver TexturedMeshGeometry.applyEdit). Limitado a MAX_UNDO_STEPS trazos y a MAX_UNDO_BYTES de memoria (se
+     * descartan los mas viejos). Solo se toca desde el hilo de render. El trazo en curso se mete en la pila de forma
+     * perezosa: al empezar el siguiente trazo o al pulsar deshacer/rehacer (ver commitPendingStrokes).
      */
-    private val undoStack = ArrayDeque<List<SceneObject>>()
-    private val redoStack = ArrayDeque<List<SceneObject>>()
+    private val undoStack = ArrayDeque<StrokeEdit>()
+    private val redoStack = ArrayDeque<StrokeEdit>()
     private val MAX_UNDO_STEPS = 50
+    private val MAX_UNDO_BYTES = 64L * 1024 * 1024
 
-    /** Copia profunda de sceneObjects: los FloatArray de SceneObject son tipo referencia y copy() solos los compartiria. */
-    private fun snapshotSceneObjects(): List<SceneObject> =
-        sceneObjects.toList().map { it.copy(rotationMatrix = it.rotationMatrix.copyOf(), shapeMatrix = it.shapeMatrix.copyOf()) }
+    /** Lo pone la interfaz (importar / New) para que el hilo de render vacie el historial: sus trazos eran de un modelo que ya no esta. */
+    @Volatile private var historyResetRequested = false
 
-    /** Guarda el estado actual de la escena en la pila de Undo - se llama SIEMPRE antes de que una accion modifique sceneObjects. */
-    fun pushUndoSnapshot() {
-        undoStack.addLast(snapshotSceneObjects())
-        if (undoStack.size > MAX_UNDO_STEPS) undoStack.removeFirst()
+    private fun applyHistoryReset() {
+        if (!historyResetRequested) return
+        historyResetRequested = false
+        undoStack.clear()
         redoStack.clear()
-        // Al recortar el historial (o descartar el Redo) alguna malla importada puede quedar sin duenio: se libera en el proximo frame.
-        requestGeometrySweep()
+        for (g in importedGeometries.values) g.discardStrokeEdit()
     }
 
-    /** Deshace la ultima accion. Devuelve false (sin hacer nada) si no hay nada para deshacer. */
+    /** Mete en el historial el trazo que se acaba de pintar (si lo hay). Un trazo nuevo invalida el Redo. */
+    private fun commitPendingStrokes() {
+        for (g in importedGeometries.values) {
+            val edit = g.takeStrokeEdit() ?: continue
+            undoStack.addLast(edit)
+            redoStack.clear()
+        }
+        var total = 0L
+        for (e in undoStack) total += e.sizeBytes()
+        while (undoStack.isNotEmpty() && (undoStack.size > MAX_UNDO_STEPS || total > MAX_UNDO_BYTES)) {
+            total -= undoStack.removeFirst().sizeBytes()
+        }
+    }
+
+    /** Deshace el ultimo trazo. Devuelve false (sin hacer nada) si no hay nada para deshacer. IMPORTANTE: llamar desde el hilo de render (glView.queueEvent). */
     fun undo(): Boolean {
-        val previous = undoStack.removeLastOrNull() ?: return false
-        redoStack.addLast(snapshotSceneObjects())
-        sceneObjects.clear()
-        sceneObjects.addAll(previous)
+        applyHistoryReset()
+        commitPendingStrokes()
+        var edit = undoStack.removeLastOrNull() ?: return false
+        // Un paso cuya capa o cuyo orden de capas ya no existe (se anadio o borro algo despues) no se puede aplicar: se descarta y se prueba con el anterior.
+        while (!edit.geo.canApply(edit)) edit = undoStack.removeLastOrNull() ?: return false
+        edit.geo.applyEdit(edit)
+        redoStack.addLast(edit)
         return true
     }
 
-    /** Igual que undo() pero al reves: mueve el snapshot actual a Undo y restaura el tope de Redo. */
+    /** Igual que undo() pero al reves: vuelve a aplicar el ultimo trazo deshecho. IMPORTANTE: llamar desde el hilo de render (glView.queueEvent). */
     fun redo(): Boolean {
-        val next = redoStack.removeLastOrNull() ?: return false
-        undoStack.addLast(snapshotSceneObjects())
-        sceneObjects.clear()
-        sceneObjects.addAll(next)
+        applyHistoryReset()
+        commitPendingStrokes()
+        var edit = redoStack.removeLastOrNull() ?: return false
+        // Igual que en undo(): un paso que ya no encaja con las capas actuales se descarta.
+        while (!edit.geo.canApply(edit)) edit = redoStack.removeLastOrNull() ?: return false
+        edit.geo.applyEdit(edit)
+        undoStack.addLast(edit)
         return true
     }
 
@@ -108,9 +127,12 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         get() = File(context.filesDir, "imported_meshes")
 
     /** Escribe la escena completa al slot fijo. Devuelve false (sin lanzar) si algo sale mal (IO, permisos). */
+    @Synchronized
     fun saveProjectToFile(): Boolean {
         return try {
-            projectFile.writeText(sceneObjectsToJson(sceneObjects, nextObjectId, meshDir))
+            val layersJson = writeLayerFiles(layerDir, snapshotAllLayers())
+            writeTextAtomically(projectFile, sceneObjectsToJson(sceneObjects.toList(), nextObjectId, meshDir, layersJson))
+            cleanupLayerFiles(layerDir, layersJson)
             cleanupImportedMeshFiles(meshDir, sceneObjects)
             true
         } catch (e: Exception) {
@@ -134,28 +156,127 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         sceneObjects.addAll(models)
         nextObjectId = maxOf(loadedNextId, (loadedObjects.maxOfOrNull { it.id } ?: -1) + 1)
 
+        // Capas pintadas guardadas: esperan a que se cree la geometria de cada modelo (ver createGeometry).
+        savedLayersByMesh.clear()
+        val savedLayers = jsonToSavedLayers(json, layerDir)
+        for (obj in models) {
+            val mesh = obj.importedMesh ?: continue
+            savedLayers[obj.id]?.let { savedLayersByMesh[mesh] = it }
+        }
+
         importedGeometries.clear()
         return true
     }
 
     /**
-     * File > New: escena vacia, pasando por Undo primero (un New accidental se puede deshacer). A proposito NO borra el
-     * archivo guardado: New solo afecta la escena en memoria; el usuario decide si hace Save despues.
+     * File > New: escena vacia. Ya no se puede deshacer (el Undo es solo de trazos) y se pierde la pintura que no se haya
+     * guardado. A proposito NO borra el archivo guardado: New solo afecta la escena en memoria; el usuario decide si hace Save despues.
      */
     fun newProject(): Boolean {
-        pushUndoSnapshot()
         sceneObjects.clear()
         nextObjectId = 0
+        historyResetRequested = true
+        requestGeometrySweep()
         return true
     }
 
-    /** Agrega un modelo importado desde OBJ (ver ObjLoader). Reemplaza al modelo anterior (pasando por Undo para poder recuperarlo). */
+    /** Agrega un modelo importado desde OBJ (ver ObjLoader). Reemplaza al modelo anterior, que se libera (no se puede deshacer). */
     fun addImportedMesh(mesh: ObjMesh): SceneObject {
-        pushUndoSnapshot()
         sceneObjects.clear()
         val newObject = SceneObject(id = nextObjectId++, importedMesh = mesh)
         sceneObjects.add(newObject)
+        historyResetRequested = true
+        requestGeometrySweep()
         return newObject
+    }
+
+    // ---- Capas (las usa LayersPanel desde el hilo de la interfaz) ----
+
+    /** Ordenes pendientes para el hilo de render (ver runOnGlThread): se ejecutan al empezar cada cuadro. */
+    private val glCommands = java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>()
+
+    /** Ejecuta block en el hilo de render, al empezar el proximo cuadro. Se puede llamar desde cualquier hilo. */
+    fun runOnGlThread(block: () -> Unit) {
+        glCommands.add(block)
+    }
+
+    private fun runGlCommands() {
+        while (true) {
+            val command = glCommands.poll() ?: break
+            command()
+        }
+    }
+
+    /**
+     * Modelo cuyas capas muestra el panel: el primero de la escena que ya tiene su geometria creada, o null si no hay
+     * modelo (o todavia no se dibujo). Se puede leer desde cualquier hilo.
+     */
+    val activeGeometry: TexturedMeshGeometry?
+        get() {
+            for (obj in sceneObjects.toList()) {
+                val mesh = obj.importedMesh ?: continue
+                val geo = importedGeometries[mesh] ?: continue
+                return geo
+            }
+            return null
+        }
+
+    /**
+     * Cambia las capas del modelo activo en el hilo de render (edit recibe su geometria) y despues avisa con onDone, tambien
+     * en el hilo de render. Antes de empezar entrega al historial el trazo que estuviera pendiente y al terminar entrega
+     * lo que haya registrado la operacion (limpiar/invertir quedan en el Deshacer). clearsHistory = true para operaciones
+     * que no se pueden deshacer (borrar o combinar capas): vacia el historial de Deshacer/Rehacer.
+     */
+    fun editLayers(clearsHistory: Boolean, edit: (TexturedMeshGeometry) -> Unit, onDone: () -> Unit) {
+        glCommands.add {
+            val geo = activeGeometry
+            if (geo != null) {
+                applyHistoryReset()
+                commitPendingStrokes()
+                edit(geo)
+                commitPendingStrokes()
+                if (clearsHistory) {
+                    undoStack.clear()
+                    redoStack.clear()
+                    for (g in importedGeometries.values) g.discardStrokeEdit()
+                }
+            }
+            onDone()
+        }
+    }
+
+    // ---- Guardado de las capas pintadas ----
+
+    /** Carpeta con los pixeles de las capas del proyecto guardado (ver ProjectSerializer.writeLayerFiles). */
+    private val layerDir: File
+        get() = File(context.filesDir, "paint_layers")
+
+    /**
+     * Capas pintadas que esperan a la geometria de su malla: las del proyecto recien cargado, y las de la geometria vieja
+     * cuando se recrea el contexto de OpenGL (la GPU se pierde, las capas en CPU no). Se entregan en createGeometry.
+     */
+    private val savedLayersByMesh = java.util.concurrent.ConcurrentHashMap<ObjMesh, SavedLayers>()
+
+    /** Aviso (hilo de render) de que Deshacer/Rehacer cambio el orden o las carpetas de las capas: LayersPanel vuelve a armar la lista. */
+    @Volatile var onLayersChanged: (() -> Unit)? = null
+
+    /** Crea la geometria de una malla (hilo de render) y le devuelve las capas pintadas que hubiera pendientes. */
+    private fun createGeometry(mesh: ObjMesh): TexturedMeshGeometry {
+        val geo = TexturedMeshGeometry(mesh)
+        geo.onLayersChanged = { onLayersChanged?.invoke() }
+        savedLayersByMesh.remove(mesh)?.let { geo.restoreLayers(it) }
+        return geo
+    }
+
+    /** Las capas de cada modelo de la escena (id del objeto -> capas), listas para guardar. No toca OpenGL: se puede llamar desde cualquier hilo. */
+    private fun snapshotAllLayers(): Map<Int, SavedLayers> {
+        val result = HashMap<Int, SavedLayers>()
+        for (obj in sceneObjects.toList()) {
+            val mesh = obj.importedMesh ?: continue
+            val saved = importedGeometries[mesh]?.snapshotLayers() ?: savedLayersByMesh[mesh] ?: continue
+            result[obj.id] = saved
+        }
+        return result
     }
 
     private val mvpMatrix = FloatArray(16)
@@ -196,6 +317,12 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     override fun onSurfaceCreated(unused: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.11f, 0.11f, 0.11f, 1f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+        // Contexto GL nuevo: lo que habia en la GPU (VBO, texturas) ya no existe, pero las capas pintadas estan en CPU: se
+        // guardan para la geometria nueva (ver createGeometry). El historial de Deshacer apuntaba a la geometria vieja, asi que se vacia.
+        if (importedGeometries.isNotEmpty()) {
+            for ((mesh, geo) in importedGeometries.entries) geo.snapshotLayers()?.let { savedLayersByMesh[mesh] = it }
+            historyResetRequested = true
+        }
         importedGeometries.clear()
         // Contexto GL recreado (por ejemplo al volver del selector de archivos): la escena ya existe en memoria, no se recarga ni se reinicia.
         if (sceneInitialized) return
@@ -214,6 +341,8 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     override fun onDrawFrame(unused: GL10?) {
         // Libera la geometria de mallas importadas que ya no usa nadie (ver requestGeometrySweep) - hilo de render, el unico valido para esto.
         sweepImportedGeometries()
+        applyHistoryReset()
+        runGlCommands()
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
         val ratio = viewportWidth.toFloat() / viewportHeight.toFloat()
@@ -251,14 +380,14 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val viewRotationMatrix = FloatArray(16)
         Matrix.multiplyMM(viewRotationMatrix, 0, viewMatrix, 0, rotationMatrix, 0)
         val importedNormalMatrix = FloatArray(16)
-        // Copia de la lista: la interfaz puede importar o deshacer mientras se dibuja.
+        // Copia de la lista: la interfaz puede importar mientras se dibuja.
         for (obj in sceneObjects.toList()) {
             if (!obj.visible) continue
             val mesh = obj.importedMesh ?: continue
             Matrix.multiplyMM(objMvpMatrix, 0, mvpMatrix, 0, objectModelMatrix(obj), 0)
             Matrix.multiplyMM(importedNormalMatrix, 0, viewRotationMatrix, 0, obj.rotationMatrix, 0)
             // La geometria con textura se crea la primera vez que se dibuja (aca, en el hilo de render) y se reutiliza despues.
-            importedGeometries.getOrPut(mesh) { TexturedMeshGeometry(mesh) }.draw(objMvpMatrix, false, importedNormalMatrix)
+            importedGeometries.getOrPut(mesh) { createGeometry(mesh) }.draw(objMvpMatrix, false, importedNormalMatrix)
         }
     }
 
@@ -313,7 +442,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     @Volatile var paintColor = intArrayOf(225, 70, 60)
     @Volatile var paintRadius = 18f
     @Volatile var paintOpacity = 1f
-    // Borrador: con paintTool == ERASER se pinta con el gris base de la textura (204) en vez del color del pincel (ver applyPaintHit).
+    // Borrador: con paintTool == ERASER se borra (baja el alfa) en la capa elegida en vez de pintar con el color del pincel (ver applyPaintHit).
     /** Herramienta activa del panel de pintura (la elige PaintPanel). Pincel y borrador pintan; el cuentagotas toma color de la textura. */
     @Volatile var paintTool = PaintTool.BRUSH
     /** Tipo de pincel (como se desvanece el borde de cada toque, ver TexturedMeshGeometry.paintDab). */
@@ -333,6 +462,9 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun paintStart(screenX: Float, screenY: Float) {
         lastPaintX = screenX
         lastPaintY = screenY
+        // El trazo anterior ya termino: pasa al historial de Undo (y un trazo nuevo invalida el Redo).
+        applyHistoryReset()
+        commitPendingStrokes()
         // Trazo nuevo: cada modelo olvida el trazo anterior, para que la opacidad se mida solo dentro de este trazo.
         for (g in importedGeometries.values) g.beginStroke()
         val startHit = pickPaintHit(screenX, screenY)
@@ -349,7 +481,10 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // Rellena el trazo desde el ultimo punto hasta el nuevo con toques parejos EN LA TEXTURA (no en pixeles de pantalla):
         // asi el espaciado no depende del zoom (ver strokeSegment). El cuentagotas no rellena: solo toma el punto final.
         val eyedropper = paintTool == PaintTool.EYEDROPPER
-        if (eyedropper) {
+        if (paintTool == PaintTool.FILL) {
+            // Relleno: un solo toque en el punto donde se apoyo el dedo (ver paintStart); arrastrar no vuelve a rellenar.
+            lastPaintHit = null
+        } else if (eyedropper) {
             paintAt(screenX, screenY)
             lastPaintHit = null
         } else {
@@ -450,9 +585,10 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val bestV = hit.v
         when (paintTool) {
             PaintTool.BRUSH -> geo.paintDab(bestU, bestV, paintRadius, paintColor[0], paintColor[1], paintColor[2], paintOpacity, paintBrushType)
-            PaintTool.ERASER -> geo.paintDab(bestU, bestV, paintRadius, 204, 204, 204, paintOpacity, paintBrushType)
+            PaintTool.ERASER -> geo.paintDab(bestU, bestV, paintRadius, 0, 0, 0, paintOpacity, paintBrushType, true)
             PaintTool.EYEDROPPER -> geo.pickColor(bestU, bestV)?.let { c -> onColorPicked?.invoke(c[0], c[1], c[2]) }
-            else -> Unit // Difuminar, Relleno y Borrosidad todavia no estan implementados (ver PaintTool.implemented).
+            PaintTool.FILL -> geo.fillAt(bestU, bestV, paintColor[0], paintColor[1], paintColor[2])
+            else -> Unit // Difuminar y Borrosidad todavia no estan implementados (ver PaintTool.implemented).
         }
     }
 }

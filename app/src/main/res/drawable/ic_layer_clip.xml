@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Recorte de capa. La punta de flecha (marker del SVG) va como triangulo relleno con borde de 30 porque Android no soporta markers. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="45"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 176.68554,441.71385 V 390.00961" />
+    <path
+        android:fillColor="#000000"
+        android:strokeColor="#000000"
+        android:strokeWidth="30"
+        android:strokeLineJoin="miter"
+        android:pathData="M 176.68554,571.54 L 64.18554,376.91 L 289.18554,376.91 Z" />
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="85.7734"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 178.90591,412.15766 V 127.23586 H 520.24882" />
+</vector>

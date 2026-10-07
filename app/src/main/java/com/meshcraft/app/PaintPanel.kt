@@ -21,7 +21,9 @@ import android.widget.Toast
  *   3. Tipo de pincel: abre el panel con los tipos de pincel.
  *   4. Color: cuadro con el color actual; abre el selector de color.
  *   5. Ocultar: triangulo que esconde todo menos si mismo.
- *   6. Capas: panel de capas (todavia vacio).
+ *   6. Capas: panel de capas reales del modelo (LayersPanel).
+ * El panel de herramientas trae ademas Mano (rotar / desplazar la camara) y Bloqueo (bloquear la camara): no son herramientas
+ * de pintura, solo se alternan ahi y, como las herramientas, cierran el panel (la accion la hace MainActivity, ver onHandToggle / onLockToggle).
  * Los cambios se aplican directo en MyGLRenderer (paintTool, paintBrushType, paintColor, paintRadius, paintOpacity).
  */
 class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearLayout(context) {
@@ -31,16 +33,29 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     private class GridItem(val iconRes: Int, val label: String, val active: Boolean, val enabled: Boolean, val onClick: () -> Unit)
 
     private val d = resources.displayMetrics.density
+    /** Alto compartido por el panel de color y el de capas (para que al cambiar de uno a otro no salte). */
+    private val bigPopupHeight = (490 * d).toInt()
     private val accent = Color.argb(235, 242, 128, 26)
+
+    // Tamano de los botones de la barra: son 6 en total (5 botones y el cuadro de color) y en pantallas angostas no caben todos, asi que
+    // se reparte el ancho disponible (pantalla menos los margenes y el relleno del panel, y menos el cuadro de color que no cambia).
+    // Nunca pasan de 40 dp, el tamano de siempre.
+    private val swatchPx = (34 * d).toInt()
+    private val barSlotPx = (resources.displayMetrics.widthPixels - (32 * d).toInt() - (swatchPx + (8 * d).toInt())) / 5
+    private val buttonSizePx = minOf((40 * d).toInt(), barSlotPx - (4 * d).toInt())
+    private val buttonMarginPx = (barSlotPx - buttonSizePx) / 2
 
     private var currentTool = PaintTool.BRUSH
     private var previousTool = PaintTool.ERASER
     private var currentBrushType = BrushType.SOFT
     private var openPopup = Popup.NONE
     private var barHidden = false
-    /** Avisa a MainActivity cuando el panel de color se abre (true) o se cierra/oculta (false), para esconder los botones laterales. */
-    var onColorPanelVisible: ((Boolean) -> Unit)? = null
-    private var colorPanelShown = false
+    /** Al pulsar Mano (panel de herramientas): MainActivity cambia entre rotar y desplazar la camara y devuelve true si quedo en modo desplazar. */
+    var onHandToggle: (() -> Boolean)? = null
+    /** Al pulsar Bloqueo (panel de herramientas): MainActivity bloquea/desbloquea la camara y devuelve true si quedo bloqueada. */
+    var onLockToggle: (() -> Boolean)? = null
+    private var handActive = false
+    private var lockActive = false
 
     private val popupContainer = FrameLayout(context)
     private val slidersBox = LinearLayout(context)
@@ -49,11 +64,11 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     private val opacityRow: IbisSliderRow = IbisSliderRow(context, 100, 100, 1, true, { it.toString() }) { renderer.paintOpacity = it / 100f; colorPanel.setOpacity(it) }
     private val colorPanel: ColorPanel = ColorPanel(context, { r, g, b -> onPickerColor(r, g, b) }) { p -> renderer.paintOpacity = p / 100f; opacityRow.setValue(p) }
     private val colorBtn = View(context)
-    private val switchBtn = makeIconButton(R.drawable.ic_swap)
-    private val toolBtn = makeIconButton(iconFor(currentTool))
-    private val brushTypeBtn = makeIconButton(R.drawable.ic_brush_type)
-    private val hideBtn = makeIconButton(R.drawable.ic_triangle_down)
-    private val layersBtn = makeIconButton(R.drawable.ic_layers)
+    private val switchBtn = makeBarButton(R.drawable.ic_swap)
+    private val toolBtn = makeBarButton(iconFor(currentTool))
+    private val brushTypeBtn = makeBarButton(R.drawable.ic_brush_type)
+    private val hideBtn = makeBarButton(R.drawable.ic_triangle_down)
+    private val layersBtn = makeBarButton(R.drawable.ic_layers)
     private val bar = LinearLayout(context)
     // Todos los botones de la barra menos Ocultar (ese siempre se ve).
     private val barButtons: List<View> = listOf(switchBtn, toolBtn, brushTypeBtn, colorBtn, layersBtn)
@@ -85,7 +100,7 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         bar.orientation = LinearLayout.HORIZONTAL
         bar.gravity = Gravity.CENTER
 
-        switchBtn.setOnClickListener { selectTool(previousTool) }
+        switchBtn.setOnClickListener { selectTool(if (handActive) currentTool else previousTool) }
         toolBtn.setOnClickListener { togglePopup(Popup.TOOLS) }
         brushTypeBtn.setOnClickListener { togglePopup(Popup.BRUSHES) }
         colorBtn.setOnClickListener { togglePopup(Popup.COLOR) }
@@ -95,8 +110,7 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         }
         layersBtn.setOnClickListener { togglePopup(Popup.LAYERS) }
 
-        val swatch = (34 * d).toInt()
-        colorBtn.layoutParams = LinearLayout.LayoutParams(swatch, swatch).apply {
+        colorBtn.layoutParams = LinearLayout.LayoutParams(swatchPx, swatchPx).apply {
             leftMargin = (4 * d).toInt()
             rightMargin = (4 * d).toInt()
         }
@@ -134,6 +148,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
             Toast.makeText(context, tool.label + ": próximamente", Toast.LENGTH_SHORT).show()
             return
         }
+        // Elegir una herramienta de pintura saca de la mano (con la mano un dedo desplaza la vista y no pinta).
+        if (handActive) handActive = onHandToggle?.invoke() ?: false
         setActiveTool(tool)
         openPopup = Popup.NONE
         rebuildPopup()
@@ -178,18 +194,32 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
             Popup.BRUSHES -> popupContainer.addView(buildBrushesPopup())
             Popup.COLOR -> popupContainer.addView(
                 colorPanel,
-                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, bigPopupHeight)
             )
-            Popup.LAYERS -> popupContainer.addView(buildLayersPopup())
+            Popup.LAYERS -> popupContainer.addView(buildLayersPopup(), FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, bigPopupHeight))
             Popup.NONE -> Unit
         }
         refresh()
     }
 
+    /**
+     * Cuadricula de herramientas (pincel, borrador, cuentagotas...) y al final Mano y Bloqueo de la camara.
+     * Mano y Bloqueo se encienden/apagan (naranja = activo); como las herramientas, cierran el panel al tocarlos (como ibisPaint).
+     */
     private fun buildToolsPopup(): View {
         val items = PaintTool.values().map { t ->
-            GridItem(iconFor(t), t.label, t == currentTool, t.implemented) { selectTool(t) }
-        }
+            GridItem(iconFor(t), t.label, t == currentTool && !handActive, t.implemented) { selectTool(t) }
+        }.toMutableList()
+        items.add(GridItem(R.drawable.ic_hand, "Mano", handActive, true) {
+            openPopup = Popup.NONE
+            handActive = onHandToggle?.invoke() ?: false
+            rebuildPopup()
+        })
+        items.add(GridItem(R.drawable.ic_lock_rotation, "Bloqueo", lockActive, true) {
+            openPopup = Popup.NONE
+            lockActive = onLockToggle?.invoke() ?: false
+            rebuildPopup()
+        })
         return buildGrid(items, 3)
     }
 
@@ -204,16 +234,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         return buildGrid(items, 3)
     }
 
-    private fun buildLayersPopup(): View {
-        val tv = TextView(context)
-        tv.text = "Capas: próximamente"
-        tv.setTextColor(Color.WHITE)
-        tv.textSize = 13f
-        tv.gravity = Gravity.CENTER
-        val p = (12 * d).toInt()
-        tv.setPadding(p, p, p, p)
-        return tv
-    }
+    /** Panel de capas estilo ibisPaint (ver LayersPanel), conectado a las capas reales del modelo que se pinta. */
+    private fun buildLayersPopup(): View = LayersPanel(context, renderer)
 
     /** Cuadricula de botones con etiqueta; los que tienen enabled = false se ven apagados (herramienta todavia no lista). */
     private fun buildGrid(items: List<GridItem>, columns: Int): View {
@@ -246,6 +268,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
                 cell.setOnClickListener { item.onClick() }
                 row.addView(cell, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             }
+            // Fila incompleta: se rellena con huecos vacios para que las celdas no se estiren y queden alineadas con las de arriba.
+            repeat(columns - chunk.size) { row.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f)) }
             grid.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
         return grid
@@ -256,13 +280,23 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     /** Actualiza iconos, resaltados y visibilidad segun el estado actual (herramienta, panel abierto, barra oculta). */
     private fun refresh() {
         val shown = !barHidden
-        val usesBrushSettings = currentTool == PaintTool.BRUSH || currentTool == PaintTool.ERASER
+        val usesBrushSettings = !handActive && (currentTool == PaintTool.BRUSH || currentTool == PaintTool.ERASER)
         popupContainer.visibility = if (shown && openPopup != Popup.NONE) View.VISIBLE else View.GONE
-        slidersBox.visibility = if (shown && usesBrushSettings) View.VISIBLE else View.GONE
+        // Los sliders de tamano y opacidad del pincel se esconden con el panel de color o el de capas abierto.
+        slidersBox.visibility = if (shown && usesBrushSettings && openPopup != Popup.COLOR && openPopup != Popup.LAYERS) View.VISIBLE else View.GONE
         for (b in barButtons) b.visibility = if (shown) View.VISIBLE else View.GONE
+        // Con el panel de capas abierto, el panel de pintura ocupa todo el ancho de la pantalla (sin margen lateral).
+        (layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+            val side = if (shown && openPopup == Popup.LAYERS) 0 else (8 * d).toInt()
+            if (lp.leftMargin != side || lp.rightMargin != side) {
+                lp.leftMargin = side
+                lp.rightMargin = side
+                layoutParams = lp
+            }
+        }
 
 
-        toolBtn.setImageResource(iconFor(currentTool))
+        toolBtn.setImageResource(if (handActive) R.drawable.ic_hand else iconFor(currentTool))
         toolBtn.background = circle(openPopup == Popup.TOOLS)
         brushTypeBtn.background = circle(openPopup == Popup.BRUSHES)
         layersBtn.background = circle(openPopup == Popup.LAYERS)
@@ -276,12 +310,6 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         background = null
         isClickable = !barHidden
 
-        // Avisa si el panel de color quedo visible o no (solo cuando cambia).
-        val colorNow = shown && openPopup == Popup.COLOR
-        if (colorNow != colorPanelShown) {
-            colorPanelShown = colorNow
-            onColorPanelVisible?.invoke(colorNow)
-        }
     }
 
     // ---- Piezas de interfaz ----
@@ -295,6 +323,21 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     private fun circle(active: Boolean) = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(if (active) accent else Color.argb(150, 40, 40, 40))
+    }
+
+    /** Boton de la barra inferior: usa el tamano repartido segun el ancho de pantalla (buttonSizePx, nunca mas de 40 dp) para que quepan todos. */
+    private fun makeBarButton(iconRes: Int): ImageView {
+        val p = buttonSizePx * 9 / 40
+        val iv = ImageView(context)
+        iv.setImageResource(iconRes)
+        iv.setPadding(p, p, p, p)
+        iv.background = circle(false)
+        iv.layoutParams = LinearLayout.LayoutParams(buttonSizePx, buttonSizePx).apply {
+            leftMargin = buttonMarginPx
+            rightMargin = buttonMarginPx
+        }
+        iv.isClickable = true
+        return iv
     }
 
     private fun makeIconButton(iconRes: Int): ImageView {

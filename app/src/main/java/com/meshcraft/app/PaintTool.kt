@@ -9,7 +9,7 @@ enum class PaintTool(val label: String, val implemented: Boolean) {
     ERASER("Borrador", true),
     EYEDROPPER("Cuentagotas", true),
     BLUR("Difuminar", false),
-    FILL("Relleno", false),
+    FILL("Relleno", true),
     SMUDGE("Borrosidad", false)
 }
 

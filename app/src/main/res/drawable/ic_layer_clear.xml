@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Limpiar capa -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M24.10243,25.411991h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M172.57851,173.88812h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M321.05463,25.411991h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M24.10243,322.3642h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M321.05463,322.3642h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M469.53073,173.88812h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M172.57851,470.84036h148.4761v148.4761h-148.4761z" />
+    <path android:fillColor="#000000" android:fillAlpha="0.6" android:pathData="M469.53073,470.84036h148.4761v148.4761h-148.4761z" />
+</vector>

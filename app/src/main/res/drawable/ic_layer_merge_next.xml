@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Incorporar a la siguiente capa (combinar hacia abajo) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <!-- Flecha hacia abajo -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="m 211.01338,171.67733 v 121.97289 l -2.54579,0.30352 c -1.41896,0.13008 -21.95221,0.26016 -45.61552,0.26016 l -43.028,0.0434 2.75446,2.68835 c 1.50243,1.47426 31.55108,30.95935 66.77478,65.56097 35.2237,34.55826 75.95632,74.53658 90.52157,88.84552 14.56525,14.26558 27.83673,27.31707 29.42264,28.96477 l 2.92139,2.94851 9.59888,-9.40921 C 382.49937,414.3223 477.02743,321.57434 489.25556,309.52014 L 504.82243,294.2139 H 459.33211 H 413.84179 V 171.93749 V 49.661079 H 312.42758 H 211.01338 Z" />
+    <!-- Dos lineas de abajo -->
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="45"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M73.341167,520.05556H556.72614" />
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="45"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M73.816597,578.16311H557.20157" />
+</vector>

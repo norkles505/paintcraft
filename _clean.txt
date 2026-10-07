@@ -1,0 +1,17 @@
+borrado Cube.kt
+borrado Torus.kt
+borrado Monkey.kt
+borrado Gizmo3D.kt
+borrado GizmoLabelView.kt
+borrado Plane.kt
+borrado Circle.kt
+borrado Cone.kt
+borrado Cylinder.kt
+borrado IcoSphere.kt
+borrado UvSphere.kt
+borrado Grid.kt
+borrado GridMesh.kt
+borrado MeshGeometry.kt
+borrado PngWriter.kt
+borrada reserva/
+PaintPanel: 17601 -> 17055 ; quedan refs onPopupVisible/popupShown: 0

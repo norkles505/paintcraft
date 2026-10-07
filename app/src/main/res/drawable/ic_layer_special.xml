@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Capa especial (cuadro con más y sombra) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="640"
+    android:viewportHeight="640">
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="54.6723"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 74.340954,153.01571 c 0,-45.2919 36.716546,-82.008445 82.008446,-82.008445 h 218.68917 c 45.29326,0 82.00843,36.716545 82.00843,82.008445 v 218.68917 c 0,45.29326 -36.71517,82.00843 -82.00843,82.00843 H 156.3494 c -45.2919,0 -82.008446,-36.71517 -82.008446,-82.00843 z" />
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="54.6723"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 566.39159,180.35185 v 300.69761 c 0,45.29327 -36.71517,82.00844 -82.00844,82.00844 H 183.68554" />
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="55"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 265.3604,158.6834 V 362.03846" />
+    <path
+        android:strokeColor="#000000"
+        android:strokeWidth="55"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 162.32247,260.67753 H 365.67753" />
+</vector>

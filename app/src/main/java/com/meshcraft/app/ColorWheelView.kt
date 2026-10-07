@@ -47,7 +47,7 @@ class ColorWheelView(context: Context, private val onChange: (Float, Float, Floa
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val maxSize = (180 * d).toInt()
+        val maxSize = (230 * d).toInt()
         val avail = MeasureSpec.getSize(widthMeasureSpec)
         val s = if (avail <= 0) maxSize else min(avail, maxSize)
         setMeasuredDimension(s, s)

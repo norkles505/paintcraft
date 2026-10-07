@@ -1,0 +1,38 @@
+Cube <= Circle.kt, Cone.kt, Cylinder.kt, GLUtils.kt, IcoSphere.kt, MeshGeometry.kt, Monkey.kt, Plane.kt, SceneObject.kt, Torus.kt, UvSphere.kt
+Torus <= GridMesh.kt, Monkey.kt, SceneObject.kt
+Monkey <= SceneObject.kt
+Gizmo3D <= GizmoLabelView.kt
+Plane <= Circle.kt, Cone.kt, Cylinder.kt, Gizmo3D.kt, Grid.kt, GridMesh.kt, IcoSphere.kt, MeshGeometry.kt, SceneObject.kt, UvSphere.kt
+Circle <= Cone.kt, Cylinder.kt, GizmoView.kt, GridMesh.kt, IcoSphere.kt, Monkey.kt, PaintPanel.kt, SceneObject.kt, Torus.kt, UvSphere.kt
+Cone <= GridMesh.kt, SceneObject.kt, Torus.kt
+Cylinder <= Cone.kt, GridMesh.kt, MeshGeometry.kt, SceneObject.kt, Torus.kt
+IcoSphere <= Cone.kt, Cylinder.kt, GridMesh.kt, Torus.kt
+UvSphere <= Cone.kt, Cylinder.kt, GridMesh.kt, IcoSphere.kt, MeshGeometry.kt, Monkey.kt, Torus.kt
+Grid <= Circle.kt, ColorPanel.kt, GizmoView.kt, GLUtils.kt, GridMesh.kt, Monkey.kt, PaintPanel.kt, Plane.kt, SceneObject.kt, Torus.kt
+GridMesh <= 
+MeshGeometry <= Circle.kt, Cone.kt, Cube.kt, Cylinder.kt, GLUtils.kt, GridMesh.kt, IcoSphere.kt, Monkey.kt, Plane.kt, SceneObject.kt, TexturedMeshGeometry.kt, Torus.kt, UvSphere.kt
+PngWriter <= 
+PngExport <= MainActivity.kt, PngWriter.kt
+GizmoView <= Gizmo3D.kt, MainActivity.kt
+GizmoLabelView <= 
+onPopupVisible <= PaintPanel.kt
+OutlinedTextView <= IbisSlider.kt
+GLUtils <= MeshGeometry.kt, TexturedMeshGeometry.kt
+BackgroundKind <= LayersPanel.kt, ProjectSerializer.kt, TexturedMeshGeometry.kt
+GIT:
+ M _build.txt
+ M app/src/main/java/com/meshcraft/app/ColorPanel.kt
+ M app/src/main/java/com/meshcraft/app/ColorWheelView.kt
+ M app/src/main/java/com/meshcraft/app/MainActivity.kt
+ M app/src/main/java/com/meshcraft/app/MyGLRenderer.kt
+ M app/src/main/java/com/meshcraft/app/PaintPanel.kt
+ M app/src/main/java/com/meshcraft/app/PaintTool.kt
+ M app/src/main/java/com/meshcraft/app/ProjectSerializer.kt
+ M app/src/main/java/com/meshcraft/app/TexturedMeshGeometry.kt
+?? _build_res.txt
+?? app/src/main/java/com/meshcraft/app/BackgroundKind.kt
+?? app/src/main/java/com/meshcraft/app/BlendModes.kt
+?? app/src/main/java/com/meshcraft/app/LayerCompositor.kt
+?? app/src/main/java/com/meshcraft/app/LayersPanel.kt
+?? app/src/main/java/com/meshcraft/app/PngExport.kt
+PngWriter size: 118
