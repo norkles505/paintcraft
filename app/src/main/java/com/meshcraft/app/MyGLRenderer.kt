@@ -541,8 +541,8 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         strokeSegment(mx, my, hitMid, x1, y1, hit1, depth + 1)
     }
 
-    /** Distancia entre toques de un trazo, en texeles: un cuarto del radio del pincel (minimo 1). */
-    private fun paintSpacing(): Float = maxOf(1f, paintRadius * 0.25f)
+    /** Distancia entre toques de un trazo, en texeles: la fraccion del radio que define el tipo de pincel (minimo 1). */
+    private fun paintSpacing(): Float = maxOf(1f, paintRadius * paintBrushType.spacing)
 
     /**
      * Busca el modelo importado y el punto de su textura que quedan bajo un punto de pantalla: convierte el punto en
@@ -588,7 +588,8 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             PaintTool.ERASER -> geo.paintDab(bestU, bestV, paintRadius, 0, 0, 0, paintOpacity, paintBrushType, true)
             PaintTool.EYEDROPPER -> geo.pickColor(bestU, bestV)?.let { c -> onColorPicked?.invoke(c[0], c[1], c[2]) }
             PaintTool.FILL -> geo.fillAt(bestU, bestV, paintColor[0], paintColor[1], paintColor[2])
-            else -> Unit // Difuminar y Borrosidad todavia no estan implementados (ver PaintTool.implemented).
+            PaintTool.BLUR -> geo.blurDab(bestU, bestV, paintRadius, paintOpacity, paintBrushType)
+            PaintTool.SMUDGE -> geo.smudgeDab(bestU, bestV, paintRadius, paintOpacity, paintBrushType)
         }
     }
 }

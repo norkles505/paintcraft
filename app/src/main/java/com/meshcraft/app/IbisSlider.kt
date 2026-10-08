@@ -236,6 +236,9 @@ class IbisSliderRow(
 
     private val slider: IbisSlider
     private val valueText: OutlinedTextView
+    // Se guardan para poder reacomodar la fila en dos lineas (ver setTitle).
+    private lateinit var minusBtn: IbisStepButton
+    private lateinit var plusBtn: IbisStepButton
 
     init {
         val d = resources.displayMetrics.density
@@ -264,6 +267,8 @@ class IbisSliderRow(
             rightMargin = (6 * d).toInt()
         })
         addView(plus, LayoutParams(btn, btn))
+        minusBtn = minus
+        plusBtn = plus
     }
 
     /** Color final de la pista (solo estilo opacidad): el color actual del pincel. */
@@ -271,6 +276,48 @@ class IbisSliderRow(
 
     /** Degradado de la pista (solo estilo normal): por ejemplo de negro a rojo para el canal R. */
     fun setGradient(colors: IntArray?) = slider.setGradient(colors)
+
+    /**
+     * Reacomoda la fila en dos lineas, como los sliders de ibisPaint: arriba el nombre ("Grosor") a la izquierda y el valor a la derecha,
+     * y abajo el boton -, el slider y el boton +. Sin llamarlo, la fila queda en una sola linea (como la usa el panel de color).
+     */
+    fun setTitle(title: String) {
+        val d = resources.displayMetrics.density
+        removeAllViews()
+        orientation = VERTICAL
+        gravity = Gravity.NO_GRAVITY
+        setPadding(0, (4 * d).toInt(), 0, (4 * d).toInt())
+
+        val header = LinearLayout(context)
+        header.orientation = HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        val label = OutlinedTextView(context)
+        label.setTextColor(Color.WHITE)
+        label.textSize = 15f
+        label.text = title
+        header.addView(label, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+        valueText.textSize = 12f
+        valueText.gravity = Gravity.END
+        header.addView(valueText, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        addView(header, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = (4 * d).toInt()
+            rightMargin = (4 * d).toInt()
+        })
+
+        val controls = LinearLayout(context)
+        controls.orientation = HORIZONTAL
+        controls.gravity = Gravity.CENTER_VERTICAL
+        val btn = (28 * d).toInt()
+        controls.addView(minusBtn, LayoutParams(btn, btn))
+        controls.addView(slider, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f).apply {
+            leftMargin = (8 * d).toInt()
+            rightMargin = (8 * d).toInt()
+        })
+        controls.addView(plusBtn, LayoutParams(btn, btn))
+        addView(controls, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+            topMargin = (2 * d).toInt()
+        })
+    }
 
     /** Fija el valor y el numero mostrado sin llamar a onChange (para sincronizar con otro control). */
     fun setValue(value: Int) {

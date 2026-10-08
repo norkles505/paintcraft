@@ -881,10 +881,11 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
                 // Borde segun el tipo de pincel: SOFT opaco en la mitad interior y se desvanece; HARD casi sin desvanecer;
                 // AIRBRUSH baja de forma cuadratica desde el centro (aerografo).
                 val t = 1f - d / radius
-                val falloff = when (brushType) {
-                    BrushType.SOFT -> minOf(1f, t * 2f)
-                    BrushType.HARD -> minOf(1f, t * 8f)
-                    BrushType.AIRBRUSH -> t * t
+                val falloff = brushType.falloff(t)
+                if (falloff <= 0f) {
+                    continue
+
+
                 }
                 val dabAlpha = falloff * opacity * (if (selMask != null) (selMask[y * texSize + x].toInt() and 0xFF) / 255f else 1f)
                 val idx = y * texSize + x
@@ -1056,6 +1057,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * toques de este trazo se midan contra el color actual de la capa. Llamar al apoyar el dedo, antes del primer toque.
      */
     fun beginStroke() {
+        smudgeValid = false
         if (strokeMaxX >= strokeMinX && strokeMaxY >= strokeMinY) {
             for (y in strokeMinY..strokeMaxY) {
                 java.util.Arrays.fill(strokeAlpha, y * texSize + strokeMinX, y * texSize + strokeMaxX + 1, 0f)
@@ -1278,6 +1280,199 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         recompositeRect(minX, minY, maxX, maxY)
         uploadRect(minX, minY, maxX, maxY)
         return true
+    }
+
+    // ---- Difuminar y Borrosidad ----
+
+    // Borrosidad (smudge): colores que "arrastra" el dedo, uno por texel de un cuadrado del tamano del pincel (alfa premultiplicado, 0..255).
+    // Se llena con el primer toque del trazo y se va mezclando con lo que el trazo pisa (ver smudgeDab).
+    private var smudgeBuf: FloatArray? = null
+    private var smudgeRad = 0
+    private var smudgeValid = false
+    /** Cuanto del color pisado se suma a lo que se arrastra en cada toque (0..1): mas bajo = la mancha llega mas lejos. */
+    private val SMUDGE_PICKUP = 0.15f
+
+    /** Peso (0..1) del toque a distancia d del centro segun el tipo de pincel (igual que en paintDab). */
+    private fun brushFalloff(brushType: BrushType, d: Float, radius: Float): Float {
+        val t = 1f - d / radius
+        return if (t <= 0f) 0f else {
+            brushType.falloff(t)
+
+
+        }
+    }
+
+    /**
+     * Pone en el texel (posicion o dentro de pix) el color dado en alfa premultiplicado: pr, pg, pb ya multiplicados por el alfa
+     * (0..255) y pa = alfa (0..255). Con bloqueo alfa solo cambia el color de lo que ya tiene algo; la transparencia no se toca.
+     */
+    private fun writePremultiplied(pix: ByteArray, o: Int, pr: Float, pg: Float, pb: Float, pa: Float, alphaLock: Boolean) {
+        if (alphaLock) {
+            if ((pix[o + 3].toInt() and 0xFF) == 0 || pa < 0.5f) return
+        } else if (pa < 0.5f) {
+            pix[o] = 0
+            pix[o + 1] = 0
+            pix[o + 2] = 0
+            pix[o + 3] = 0
+            return
+        }
+        val inv = 255f / pa
+        pix[o] = (pr * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+        pix[o + 1] = (pg * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+        pix[o + 2] = (pb * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+        if (!alphaLock) pix[o + 3] = (pa + 0.5f).toInt().coerceIn(0, 255).toByte()
+    }
+
+    /**
+     * Difuminar: un toque que suaviza la CAPA ELEGIDA dentro del circulo de radio radius (texeles) centrado en (u, v). Cada texel
+     * se acerca al promedio de sus vecinos (3x3, ponderado por el alfa) en la medida strength (0..1) por el borde del pincel,
+     * asi pasar varias veces lo difumina mas. Respeta la seleccion, el bloqueo alfa y las capas bloqueadas u ocultas. Se puede deshacer.
+     * IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
+     */
+    fun blurDab(u: Float, v: Float, radius: Float, strength: Float, brushType: BrushType = BrushType.SOFT) {
+        if (released) return
+        val layer = selectedLayer() ?: return
+        if (layer.isFolder || layer.locked || !layer.visible) return
+        val pix = layer.pixels
+        val alphaLock = layer.alphaLock
+        val selMask = selectionMask
+        val cx = u * (texSize - 1)
+        val cy = v * (texSize - 1)
+        val x0 = maxOf(0, Math.floor((cx - radius).toDouble()).toInt())
+        val x1 = minOf(texSize - 1, Math.ceil((cx + radius).toDouble()).toInt())
+        val y0 = maxOf(0, Math.floor((cy - radius).toDouble()).toInt())
+        val y1 = minOf(texSize - 1, Math.ceil((cy + radius).toDouble()).toInt())
+        if (x1 < x0 || y1 < y0) return
+        // Antes de tocar un solo pixel: guarda las baldosas de la zona para poder deshacer.
+        saveTilesForUndo(layer, x0, y0, x1, y1)
+        // Copia de la zona (con 1 texel de margen) para promediar siempre con los pixeles de antes del toque.
+        val sx0 = maxOf(0, x0 - 1)
+        val sy0 = maxOf(0, y0 - 1)
+        val sx1 = minOf(texSize - 1, x1 + 1)
+        val sy1 = minOf(texSize - 1, y1 + 1)
+        val sw = sx1 - sx0 + 1
+        val src = ByteArray(sw * (sy1 - sy0 + 1) * 4)
+        for (row in sy0..sy1) {
+            System.arraycopy(pix, (row * texSize + sx0) * 4, src, (row - sy0) * sw * 4, sw * 4)
+        }
+        for (y in y0..y1) {
+            for (x in x0..x1) {
+                val ddx = x - cx
+                val ddy = y - cy
+                val d = Math.sqrt((ddx * ddx + ddy * ddy).toDouble()).toFloat()
+                if (d >= radius) continue
+                val sel = if (selMask != null) (selMask[y * texSize + x].toInt() and 0xFF) / 255f else 1f
+                val k = brushFalloff(brushType, d, radius) * strength * sel
+                if (k <= 0f) continue
+                var sumR = 0
+                var sumG = 0
+                var sumB = 0
+                var sumA = 0
+                var count = 0
+                for (ny in maxOf(sy0, y - 1)..minOf(sy1, y + 1)) {
+                    for (nx in maxOf(sx0, x - 1)..minOf(sx1, x + 1)) {
+                        val so = ((ny - sy0) * sw + (nx - sx0)) * 4
+                        val a = src[so + 3].toInt() and 0xFF
+                        sumA += a
+                        sumR += (src[so].toInt() and 0xFF) * a
+                        sumG += (src[so + 1].toInt() and 0xFF) * a
+                        sumB += (src[so + 2].toInt() and 0xFF) * a
+                        count++
+                    }
+                }
+                val o = (y * texSize + x) * 4
+                val oa = pix[o + 3].toInt() and 0xFF
+                // Nada que suavizar: el texel y sus vecinos estan vacios.
+                if (oa == 0 && sumA == 0) continue
+                val oldR = (pix[o].toInt() and 0xFF) * oa / 255f
+                val oldG = (pix[o + 1].toInt() and 0xFF) * oa / 255f
+                val oldB = (pix[o + 2].toInt() and 0xFF) * oa / 255f
+                val tr = sumR / (255f * count)
+                val tg = sumG / (255f * count)
+                val tb = sumB / (255f * count)
+                val ta = sumA.toFloat() / count
+                writePremultiplied(pix, o, oldR + (tr - oldR) * k, oldG + (tg - oldG) * k, oldB + (tb - oldB) * k, oa + (ta - oa) * k, alphaLock)
+            }
+        }
+        recompositeRect(x0, y0, x1, y1)
+        uploadRect(x0, y0, x1, y1)
+    }
+
+    /**
+     * Borrosidad (smudge): arrastra el color de la CAPA ELEGIDA a lo largo del trazo, como un dedo sobre pintura fresca. El primer
+     * toque del trazo (despues de beginStroke) solo recoge los colores bajo el pincel; los siguientes los depositan en el circulo
+     * de radio radius centrado en (u, v), en la medida strength (0..1) por el borde del pincel, y recogen un poco de lo que pisan.
+     * Respeta la seleccion, el bloqueo alfa y las capas bloqueadas u ocultas. Se puede deshacer.
+     * IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
+     */
+    fun smudgeDab(u: Float, v: Float, radius: Float, strength: Float, brushType: BrushType = BrushType.SOFT) {
+        if (released) return
+        val layer = selectedLayer() ?: return
+        if (layer.isFolder || layer.locked || !layer.visible) return
+        val pix = layer.pixels
+        val alphaLock = layer.alphaLock
+        val selMask = selectionMask
+        val cx = u * (texSize - 1)
+        val cy = v * (texSize - 1)
+        val rad = Math.ceil(radius.toDouble()).toInt().coerceAtLeast(1)
+        val side = rad * 2 + 1
+        val left = Math.round(cx) - rad
+        val top = Math.round(cy) - rad
+        var buf = smudgeBuf
+        if (buf == null || smudgeRad != rad) {
+            buf = FloatArray(side * side * 4)
+            smudgeBuf = buf
+            smudgeRad = rad
+            smudgeValid = false
+        }
+        val x0 = maxOf(0, left)
+        val x1 = minOf(texSize - 1, left + side - 1)
+        val y0 = maxOf(0, top)
+        val y1 = minOf(texSize - 1, top + side - 1)
+        if (x1 < x0 || y1 < y0) return
+        val first = !smudgeValid
+        // Antes de tocar un solo pixel: guarda las baldosas de la zona para poder deshacer (el primer toque solo recoge, no cambia nada).
+        if (!first) saveTilesForUndo(layer, x0, y0, x1, y1)
+        for (y in y0..y1) {
+            for (x in x0..x1) {
+                val o = (y * texSize + x) * 4
+                val i = ((y - top) * side + (x - left)) * 4
+                val ua = pix[o + 3].toInt() and 0xFF
+                val ur = (pix[o].toInt() and 0xFF) * ua / 255f
+                val ug = (pix[o + 1].toInt() and 0xFF) * ua / 255f
+                val ub = (pix[o + 2].toInt() and 0xFF) * ua / 255f
+                if (first) {
+                    buf[i] = ur
+                    buf[i + 1] = ug
+                    buf[i + 2] = ub
+                    buf[i + 3] = ua.toFloat()
+                    continue
+                }
+                val ddx = x - cx
+                val ddy = y - cy
+                val d = Math.sqrt((ddx * ddx + ddy * ddy).toDouble()).toFloat()
+                if (d < radius) {
+                    val sel = if (selMask != null) (selMask[y * texSize + x].toInt() and 0xFF) / 255f else 1f
+                    val k = brushFalloff(brushType, d, radius) * strength * sel
+                    if (k > 0f) {
+                        writePremultiplied(
+                            pix, o,
+                            ur + (buf[i] - ur) * k, ug + (buf[i + 1] - ug) * k, ub + (buf[i + 2] - ub) * k, ua + (buf[i + 3] - ua) * k,
+                            alphaLock
+                        )
+                    }
+                }
+                // El dedo recoge un poco de lo que pisa (con los pixeles de antes del toque).
+                buf[i] += (ur - buf[i]) * SMUDGE_PICKUP
+                buf[i + 1] += (ug - buf[i + 1]) * SMUDGE_PICKUP
+                buf[i + 2] += (ub - buf[i + 2]) * SMUDGE_PICKUP
+                buf[i + 3] += (ua - buf[i + 3]) * SMUDGE_PICKUP
+            }
+        }
+        smudgeValid = true
+        if (first) return
+        recompositeRect(x0, y0, x1, y1)
+        uploadRect(x0, y0, x1, y1)
     }
 
     private fun drawFaces(mvpMatrix: FloatArray, normalMatrix: FloatArray) {
