@@ -131,14 +131,14 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     private val popupContainer = FrameLayout(context)
     private val slidersBox = LinearLayout(context)
     // Sliders estilo ibisPaint: tamano del pincel (radio en texeles, 1..100) y opacidad (0..100).
-    private val sizeRow = IbisSliderRow(context, 990, 170, 5, false, { "%.1fpx".format(1f + it / 10f) }) {
+    private val sizeRow = IbisSliderRow(context, 990, 170, 5, false, { "%.1f".format(1f + it / 10f) }) {
         val radius = 1f + it / 10f
         renderer.paintRadius = radius
         // El tamano queda guardado para el pincel actual y se actualiza su numero en la lista (si esta abierta).
         brushSizes[currentBrushType] = radius
         brushSizeLabels[currentBrushType]?.text = "%.1f".format(radius)
     }
-    private val opacityRow: IbisSliderRow = IbisSliderRow(context, 100, 100, 1, true, { it.toString() + "%" }) { renderer.paintOpacity = it / 100f; colorPanel.setOpacity(it) }
+    private val opacityRow: IbisSliderRow = IbisSliderRow(context, 100, 100, 1, true, { it.toString() }) { renderer.paintOpacity = it / 100f; colorPanel.setOpacity(it) }
     private val colorPanel: ColorPanel = ColorPanel(context, { r, g, b -> onPickerColor(r, g, b) }) { p -> renderer.paintOpacity = p / 100f; opacityRow.setValue(p) }
     private val colorBtn = View(context)
     private val switchBtn = makeBarButton(R.drawable.ic_swap)
@@ -169,7 +169,7 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
             cornerRadius = 10 * d
             setColor(Color.TRANSPARENT)
         }
-        slidersBox.setPadding((12 * d).toInt(), (6 * d).toInt(), (12 * d).toInt(), (8 * d).toInt())
+        slidersBox.setPadding((6 * d).toInt(), (2 * d).toInt(), (6 * d).toInt(), (2 * d).toInt())
         addView(slidersBox, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             bottomMargin = (6 * d).toInt()
         })
@@ -202,9 +202,9 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
 
         renderer.paintTool = currentTool
         applyBrush(currentBrushType)
-        // Filas de dos lineas (nombre y valor arriba; boton -, slider y boton + abajo), como en ibisPaint.
-        sizeRow.setTitle("Grosor")
-        opacityRow.setTitle("Opacidad")
+
+
+
         // Cuentagotas: el renderer avisa desde el hilo de render, el cambio de color se aplica en el hilo de la interfaz.
         renderer.onColorPicked = { r, g, b -> post { applyColor(r, g, b, true) } }
         applyColor(225, 70, 60, true)
