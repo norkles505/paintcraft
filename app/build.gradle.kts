@@ -34,4 +34,6 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // Lector de codigos QR (importar pinceles de ibisPaint desde una imagen, ver QrImageReader).
+    implementation("com.google.zxing:core:3.5.3")
 }

@@ -121,6 +121,9 @@ class MyGLSurfaceView(context: Context) : GLSurfaceView(context) {
                     lastX = e.x
                     lastY = e.y
                 } else if (painting) {
+                    // Android junta varias posiciones del dedo en un solo evento (las anteriores van en el "historial"): se pintan todas, en
+                    // orden, y despues la actual. Con solo la ultima, un trazo rapido y curvo salia hecho de rectas con esquinas.
+                    for (h in 0 until e.historySize) onPaintMove?.invoke(e.getHistoricalX(h), e.getHistoricalY(h))
                     onPaintMove?.invoke(e.x, e.y)
                 } else if (paintPending) {
                     lastX = e.x

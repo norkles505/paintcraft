@@ -401,10 +401,10 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val ndcX = (2f * screenX / viewportWidth) - 1f
         val ndcY = 1f - (2f * screenY / viewportHeight)
 
-        val vpMatrix = FloatArray(16)
-        Matrix.multiplyMM(vpMatrix, 0, projectionMatrix, 0, scratch, 0)
-        val invMatrix = FloatArray(16)
-        if (!Matrix.invertM(invMatrix, 0, vpMatrix, 0)) return null
+        val invMatrix = cachedInverseViewProjection() ?: return null
+        // La inversa de proyeccion*camara sale del cache de este evento (ver cachedInverseViewProjection);
+        // si no se pudiera invertir (no deberia pasar), no hay rayo.
+        // Con esa inversa se arman los dos puntos del rayo (el cercano y el lejano) que corresponden al punto de pantalla.
 
         val nearPoint = floatArrayOf(ndcX, ndcY, -1f, 1f)
         val farPoint = floatArrayOf(ndcX, ndcY, 1f, 1f)
@@ -462,6 +462,10 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun paintStart(screenX: Float, screenY: Float) {
         lastPaintX = screenX
         lastPaintY = screenY
+        resetPickCache()
+        // Por si el trazo anterior no llego a avisar que termino (paintEnd): pinta sus ultimos toques antes de empezar otro, y reinicia la cuenta del desvanecido.
+        paintEnd()
+        resetStrokeDynamics()
         // El trazo anterior ya termino: pasa al historial de Undo (y un trazo nuevo invalida el Redo).
         applyHistoryReset()
         commitPendingStrokes()
@@ -480,6 +484,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun paintMove(screenX: Float, screenY: Float) {
         // Rellena el trazo desde el ultimo punto hasta el nuevo con toques parejos EN LA TEXTURA (no en pixeles de pantalla):
         // asi el espaciado no depende del zoom (ver strokeSegment). El cuentagotas no rellena: solo toma el punto final.
+        resetPickCache()
         val eyedropper = paintTool == PaintTool.EYEDROPPER
         if (paintTool == PaintTool.FILL) {
             // Relleno: un solo toque en el punto donde se apoyo el dedo (ver paintStart); arrastrar no vuelve a rellenar.
@@ -496,13 +501,46 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         lastPaintY = screenY
     }
 
+    // ---- Cache de los rayos de un evento de pintura ----
+    // Dentro de un mismo evento (paintStart, paintMove, isModelAt) la camara no cambia, y un movimiento del dedo hace decenas de rayos:
+    // la inversa de proyeccion*camara y la de la matriz de cada modelo se calculan una vez y se reusan. Se vacia al entrar a cada
+    // evento (ver resetPickCache), porque entre un evento y otro se dibujan cuadros y la camara puede haberse movido.
+    private val invViewProjection = FloatArray(16)
+    private var invViewProjectionState = 0 // 0 = sin calcular, 1 = lista, 2 = no se pudo invertir
+    private val modelInverseCache = java.util.IdentityHashMap<SceneObject, FloatArray?>()
+
+    private fun resetPickCache() {
+        invViewProjectionState = 0
+        modelInverseCache.clear()
+    }
+
+    private fun cachedInverseViewProjection(): FloatArray? {
+        if (invViewProjectionState == 0) {
+            val vp = FloatArray(16)
+            Matrix.multiplyMM(vp, 0, projectionMatrix, 0, scratch, 0)
+            invViewProjectionState = if (Matrix.invertM(invViewProjection, 0, vp, 0)) 1 else 2
+        }
+        return if (invViewProjectionState == 1) invViewProjection else null
+    }
+
+    private fun inverseModel(obj: SceneObject): FloatArray? {
+        if (modelInverseCache.containsKey(obj)) return modelInverseCache[obj]
+        val inv = FloatArray(16)
+        val result = if (Matrix.invertM(inv, 0, objectModelMatrix(obj), 0)) inv else null
+        modelInverseCache[obj] = result
+        return result
+    }
+
     /** Un toque de la herramienta activa en un punto de pantalla (ver pickPaintHit y applyPaintHit). */
     private fun paintAt(screenX: Float, screenY: Float) {
         pickPaintHit(screenX, screenY)?.let { applyPaintHit(it) }
     }
 
     /** true si hay un modelo importado bajo ese punto de pantalla. IMPORTANTE: llamar desde el hilo de render (glView.queueEvent). */
-    fun isModelAt(screenX: Float, screenY: Float): Boolean = pickPaintHit(screenX, screenY) != null
+    fun isModelAt(screenX: Float, screenY: Float): Boolean {
+        resetPickCache()
+        return pickPaintHit(screenX, screenY) != null
+    }
 
     /** Punto de textura bajo un punto de pantalla, o null si ahi no hay ningun modelo importado. */
     private fun pickPaintHit(screenX: Float, screenY: Float): PaintHit? {
@@ -529,8 +567,11 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             // Un extremo fuera del modelo (o en otro modelo): no hay distancia de textura que medir, se usa la de pantalla.
             screenDist <= 6f
         }
-        // Corte de seguridad: pieza de menos de 1 px (cruce de costura UV), o demasiadas subdivisiones.
-        if (close || screenDist < 1f || depth >= 8) {
+        // El tramo se parte por la mitad hasta que sus extremos quedan a un espaciado de toque o menos (en la textura).
+        // Corte de seguridad: pieza casi sin largo (cruce de costura UV), o demasiadas subdivisiones. Antes se cortaba en 1 px y en 8 niveles
+        // (256 piezas): con un pincel que en pantalla mide menos de 1 px, o un arrastre muy rapido, dejaba huecos (punteado). Ahora se puede
+        // partir hasta 0.05 px y 12 niveles (4096 piezas); sale barato porque cada rayo ya no recorre todo el modelo (ver TriBvh).
+        if (close || screenDist < 0.05f || depth >= 12) {
             if (hit1 != null) applyPaintHit(hit1)
             return
         }
@@ -541,8 +582,9 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         strokeSegment(mx, my, hitMid, x1, y1, hit1, depth + 1)
     }
 
-    /** Distancia entre toques de un trazo, en texeles: la fraccion del radio que define el tipo de pincel (minimo 1). */
-    private fun paintSpacing(): Float = maxOf(1f, paintRadius * paintBrushType.spacing)
+    // Espaciado de los toques de un trazo (lo usa strokeSegment).
+    /** Distancia entre toques de un trazo, en texeles: la fraccion del radio que define el tipo de pincel (minimo medio texel, para que un pincel de radio 1 tampoco deje huecos). */
+    private fun paintSpacing(): Float = maxOf(0.5f, paintRadius * paintBrushType.spacing)
 
     /**
      * Busca el modelo importado y el punto de su textura que quedan bajo un punto de pantalla: convierte el punto en
@@ -560,8 +602,8 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             if (!obj.visible) continue
             val mesh = obj.importedMesh ?: continue
             val geo = importedGeometries[mesh] ?: continue
-            val inv = FloatArray(16)
-            if (!Matrix.invertM(inv, 0, objectModelMatrix(obj), 0)) continue
+            val inv = inverseModel(obj) ?: continue
+            // (la inversa de la matriz del modelo sale del cache de este evento, ver inverseModel)
             val o = FloatArray(4)
             val d = FloatArray(4)
             Matrix.multiplyMV(o, 0, inv, 0, floatArrayOf(rayOrigin[0], rayOrigin[1], rayOrigin[2], 1f), 0)
@@ -578,13 +620,158 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         onHit(PaintHit(geo, bestU, bestV))
     }
 
+    // ---- Desvanecidos del trazo (ver BrushDynamics) ----
+
+    /**
+     * Un toque del pincel del trazo en curso: donde cayo (hit), la distancia en texeles que llevaba el trazo (dist), su numero de toque en la
+     * geometria (serial: el grano depende de el, asi se repinta igual) y el tamano y la opacidad con que se pinto por el desvanecido del principio.
+     */
+    private class StrokeDab(val hit: PaintHit, val dist: Float, val serial: Int, val sizeF: Float, val opacityF: Float)
+
+    /** Ultimos toques del trazo en curso, solo con pinceles que tienen desvanecido al final: al soltar el dedo se repintan con ese desvanecido (ver applyEndFade). */
+    private val recentDabs = ArrayList<StrokeDab>()
+    /** Distancia recorrida por el trazo hasta su ultimo toque, y ese toque (para medir la distancia al siguiente). */
+    private var strokeDist = 0f
+    private var strokeLastDab: PaintHit? = null
+
+    /** Empieza de cero el seguimiento del trazo para los desvanecidos. */
+    private fun resetStrokeDynamics() {
+        recentDabs.clear()
+        strokeDist = 0f
+        strokeLastDab = null
+    }
+
+    /**
+     * El trazo termino (se solto el dedo, llego un segundo dedo o se cancelo el gesto). Los pinceles con desvanecido al final pintan cada toque
+     * de inmediato, sin esperar, y aca repintan la cola con el desvanecido: hasta este momento no se sabe donde termina el trazo. Sin efecto con
+     * los demas pinceles. IMPORTANTE: llamar desde el hilo de render (glView.queueEvent).
+     */
+    fun paintEnd() {
+        val dyn = paintBrushType.dynamics
+        if (dyn.hasEnd && recentDabs.isNotEmpty()) applyEndFade(dyn)
+        recentDabs.clear()
+    }
+
+    /** Toque del pincel normal: se pinta de inmediato (con el desvanecido del principio, que ya se conoce) y, si el pincel tiene desvanecido al final, se recuerda para repintarlo al soltar el dedo. */
+    private fun paintBrushDab(hit: PaintHit) {
+        val dyn = paintBrushType.dynamics
+        if (!dyn.hasStart && !dyn.hasEnd) {
+            drawBrushDab(hit, dyn, 1f, 1f)
+            return
+        }
+        val prev = strokeLastDab
+        if (prev != null && prev.geo === hit.geo) {
+            val du = (hit.u - prev.u) * hit.geo.texSize
+            val dv = (hit.v - prev.v) * hit.geo.texSize
+            strokeDist += sqrt(du * du + dv * dv)
+        }
+        strokeLastDab = hit
+        val diameter = paintRadius * 2f
+        val startLen = if (dyn.hasStart) dyn.startLength * diameter else 0f
+        val sizeF = ramp(dyn.startSize, strokeDist, startLen)
+        val opacityF = ramp(dyn.startOpacity, strokeDist, startLen)
+        drawBrushDab(hit, dyn, sizeF, opacityF)
+        if (dyn.hasEnd) {
+            recentDabs.add(StrokeDab(hit, strokeDist, hit.geo.lastDabSerial(), sizeF, opacityF))
+            // Solo se guardan los toques que un desvanecido puede cambiar: los de los dos extremos (un trazo corto, hasta entero) y los que los tocan.
+            val keep = startLen + dyn.endLength * diameter + 4f * paintRadius
+            while (recentDabs.size > 1 && strokeDist - recentDabs[0].dist > keep) recentDabs.removeAt(0)
+        }
+    }
+
+    /** Factor de un desvanecido: vale from al inicio (dist = 0) y sube a 1 a la distancia len. Con len <= 0 no hay desvanecido (vale 1). */
+    private fun ramp(from: Float, dist: Float, len: Float): Float {
+        if (len <= 0f) return 1f
+        val t = (dist / len).coerceIn(0f, 1f)
+        return from + (1f - from) * t
+    }
+
+    /**
+     * Al soltar el dedo: repinta el final del trazo con su desvanecido, sin que se haya notado retraso mientras se dibujaba.
+     *  - A = los toques que cambian: los del final (o todos si el trazo es mas corto que los dos desvanecidos juntos; entonces cada desvanecido se
+     *    acorta en proporcion, y un toque simple sale con todo su tamano y opacidad).
+     *  - S = los toques anteriores cuyo circulo toca el de alguno de A: comparten texeles con ellos, y como cada texel guarda el MAXIMO de los toques
+     *    que lo tocaron, hay que repintarlos tambien.
+     * Se vuelve al color de antes del trazo en los circulos de A y se repiten, en el orden de siempre, los toques de S y A: los de S como se pintaron
+     * y los de A con el desvanecido. Da el mismo resultado que si el final del trazo se hubiera conocido de antemano.
+     */
+    private fun applyEndFade(dyn: BrushDynamics) {
+        val dabs = recentDabs
+        val geo = dabs[dabs.size - 1].hit.geo
+        val total = strokeDist
+        val diameter = paintRadius * 2f
+        var startLen = if (dyn.hasStart) dyn.startLength * diameter else 0f
+        var endLen = dyn.endLength * diameter
+        val short = startLen + endLen > total
+        if (short) {
+            val k = total / (startLen + endLen)
+            startLen *= k
+            endLen *= k
+        }
+        val n = dabs.size
+        val inA = BooleanArray(n) { dabs[it].hit.geo === geo && (short || dabs[it].dist > total - endLen) }
+        if (inA.none { it }) return
+        val texSize = geo.texSize
+        val replay = BooleanArray(n)
+        for (j in 0 until n) {
+            if (inA[j]) {
+                replay[j] = true
+                continue
+            }
+            val dj = dabs[j]
+            if (dj.hit.geo !== geo) continue
+            val rj = maxOf(0.5f, paintRadius * dj.sizeF)
+            for (i in 0 until n) {
+                if (!inA[i]) continue
+                val di = dabs[i]
+                val du = (dj.hit.u - di.hit.u) * texSize
+                val dv = (dj.hit.v - di.hit.v) * texSize
+                val reach = rj + maxOf(0.5f, paintRadius * di.sizeF)
+                if (du * du + dv * dv <= reach * reach) {
+                    replay[j] = true
+                    break
+                }
+            }
+        }
+        val aList = (0 until n).filter { inA[it] }
+        geo.revertStrokeCircles(
+            FloatArray(aList.size) { dabs[aList[it]].hit.u },
+            FloatArray(aList.size) { dabs[aList[it]].hit.v },
+            FloatArray(aList.size) { maxOf(0.5f, paintRadius * dabs[aList[it]].sizeF) }
+        )
+        val lastSerial = geo.lastDabSerial()
+        for (k in 0 until n) {
+            if (!replay[k]) continue
+            val d = dabs[k]
+            var sizeF = d.sizeF
+            var opacityF = d.opacityF
+            if (inA[k]) {
+                sizeF = ramp(dyn.startSize, d.dist, startLen) * ramp(dyn.endSize, total - d.dist, endLen)
+                opacityF = ramp(dyn.startOpacity, d.dist, startLen) * ramp(dyn.endOpacity, total - d.dist, endLen)
+            }
+            // Mismo numero de toque que tuvo: mismo grano y misma cuenta de pasadas.
+            geo.setDabSerial(d.serial - 1)
+            drawBrushDab(d.hit, dyn, sizeF, opacityF)
+        }
+        geo.setDabSerial(lastSerial)
+    }
+
+    /** Pinta el toque del pincel con el tamano y la opacidad multiplicados por sizeF y opacityF (desvanecidos) y con el grano del pincel. */
+    private fun drawBrushDab(hit: PaintHit, dyn: BrushDynamics, sizeF: Float, opacityF: Float) {
+        val radius = maxOf(0.5f, paintRadius * sizeF)
+        hit.geo.paintDab(
+            hit.u, hit.v, radius, paintColor[0], paintColor[1], paintColor[2],
+            paintOpacity * dyn.opacityScale * opacityF, paintBrushType, false, dyn.grain, paintRadius
+        )
+    }
+
     /** Aplica la herramienta activa (pincel, borrador o cuentagotas) en un punto de textura. IMPORTANTE: hilo de render (usa OpenGL). */
     private fun applyPaintHit(hit: PaintHit) {
         val geo = hit.geo
         val bestU = hit.u
         val bestV = hit.v
         when (paintTool) {
-            PaintTool.BRUSH -> geo.paintDab(bestU, bestV, paintRadius, paintColor[0], paintColor[1], paintColor[2], paintOpacity, paintBrushType)
+            PaintTool.BRUSH -> paintBrushDab(hit)
             PaintTool.ERASER -> geo.paintDab(bestU, bestV, paintRadius, 0, 0, 0, paintOpacity, paintBrushType, true)
             PaintTool.EYEDROPPER -> geo.pickColor(bestU, bestV)?.let { c -> onColorPicked?.invoke(c[0], c[1], c[2]) }
             PaintTool.FILL -> geo.fillAt(bestU, bestV, paintColor[0], paintColor[1], paintColor[2])

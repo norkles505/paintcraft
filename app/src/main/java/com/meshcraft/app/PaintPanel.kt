@@ -125,6 +125,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     var onHandToggle: (() -> Boolean)? = null
     /** Al pulsar Bloqueo (panel de herramientas): MainActivity bloquea/desbloquea la camara y devuelve true si quedo bloqueada. */
     var onLockToggle: (() -> Boolean)? = null
+    /** Al elegir "Importar código QR del pincel" en el menú de la lista de pinceles: MainActivity abre el selector de imagen y despues llama a importIbisBrush. */
+    var onImportBrushQr: (() -> Unit)? = null
     private var handActive = false
     private var lockActive = false
 
@@ -201,6 +203,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         addView(bar)
 
         renderer.paintTool = currentTool
+        // Los pinceles importados de ibisPaint que se guardaron la ultima vez vuelven a la lista (pestana Personalizado).
+        ImportedBrushStore.load(context)
         applyBrush(currentBrushType)
 
 
@@ -254,6 +258,34 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         val size = brushSizes[bt] ?: bt.defaultSize
         renderer.paintRadius = size
         sizeRow.setValue(((size - 1f) * 10f).roundToInt())
+    }
+
+    /** Agrega a la lista un pincel importado de ibisPaint (pestaña Personalizado), lo guarda para la próxima vez y lo deja elegido. Llamar desde el hilo de la interfaz. */
+    fun importIbisBrush(brush: IbisBrush) {
+        val bt = BrushType.addImported(brush)
+        ImportedBrushStore.save(context)
+        brushTab = 1
+        applyBrush(bt)
+        openPopup = Popup.BRUSHES
+        rebuildPopup()
+    }
+
+    /** Pulsación larga sobre un pincel importado: pregunta si quitarlo de la lista (los pinceles propios de paintcraft no se pueden quitar). */
+    private fun confirmRemoveBrush(bt: BrushType) {
+        android.app.AlertDialog.Builder(context)
+            .setTitle("Quitar pincel")
+            .setMessage("¿Quitar \"" + bt.label + "\" de la lista?")
+            .setPositiveButton("Quitar") { _, _ ->
+                BrushType.removeImported(bt)
+                brushSizes.remove(bt)
+                brushPreviews.remove(bt)
+                brushRowPreviews.remove(bt)
+                ImportedBrushStore.save(context)
+                if (currentBrushType === bt) applyBrush(BrushType.SOFT)
+                rebuildPopup()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
     }
 
     // ---- Color ----
@@ -389,7 +421,17 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         val list = LinearLayout(context)
         list.orientation = LinearLayout.VERTICAL
         list.setBackgroundColor(Color.WHITE)
-        for ((index, bt) in BrushType.values().withIndex()) {
+        // Básico: los pinceles de paintcraft. Personalizado: los importados de ibisPaint.
+        val shown = BrushType.values().filter { (it.ibis != null) == (brushTab == 1) }
+        if (shown.isEmpty()) {
+            val hint = TextView(context)
+            hint.text = "Todavía no importaste ningún pincel.\nToca ⋮ (arriba a la derecha) y elige \"Importar código QR del pincel\". Para quitar uno, mantén pulsada su fila."
+            hint.setTextColor(Color.rgb(90, 90, 90))
+            hint.textSize = 13f
+            hint.setPadding((14 * d).toInt(), (16 * d).toInt(), (14 * d).toInt(), (16 * d).toInt())
+            list.addView(hint)
+        }
+        for ((index, bt) in shown.withIndex()) {
             if (index > 0) {
                 val divider = View(context)
                 divider.setBackgroundColor(Color.rgb(205, 205, 205))
@@ -433,7 +475,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
 
         menu.addView(buildBrushMenuRow(R.drawable.ic_qr_scan, "Importar código QR del pincel") {
             popup.dismiss()
-            Toast.makeText(context, "Importar código QR: próximamente", Toast.LENGTH_SHORT).show()
+            val importHandler = onImportBrushQr
+            if (importHandler != null) importHandler() else Toast.makeText(context, "Importar código QR: próximamente", Toast.LENGTH_SHORT).show()
         })
         val divider = View(context)
         divider.setBackgroundColor(Color.rgb(200, 200, 200))
@@ -545,6 +588,8 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
     private fun buildBrushRow(bt: BrushType): View {
         val row = FrameLayout(context)
         row.setBackgroundColor(if (bt == currentBrushType) Color.rgb(205, 222, 247) else Color.WHITE)
+        // Un pincel importado se puede quitar con una pulsación larga.
+        if (bt.ibis != null) row.setOnLongClickListener { confirmRemoveBrush(bt); true }
 
         val preview = ImageView(context)
         preview.scaleType = ImageView.ScaleType.FIT_XY

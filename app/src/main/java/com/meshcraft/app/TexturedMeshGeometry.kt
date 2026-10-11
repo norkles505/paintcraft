@@ -247,6 +247,29 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
     private val samplerHandle = GLES20.glGetUniformLocation(program, "uTexture")
 
     private val vertexCount: Int = mesh.vertexCount
+
+    /**
+     * Acelerador del raycast de la pintura (ver TriBvh y pickUv). Armarlo puede tardar en modelos con cientos de miles de triangulos,
+     * asi que se hace en un hilo aparte con prioridad baja; mientras no este listo (null) pickUv recorre todos los triangulos como antes.
+     */
+    @Volatile private var triBvh: TriBvh? = null
+
+    init {
+        val positions = mesh.positions
+        val triCount = vertexCount / 3
+        Thread {
+            try {
+                val bvh = TriBvh(positions, triCount)
+                if (!released) triBvh = bvh
+            } catch (e: Throwable) {
+                // Sin memoria u otro problema: no pasa nada, pickUv sigue con el recorrido completo.
+            }
+        }.apply {
+            name = "bvh-build"
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }.start()
+    }
     private val vbo: Int
     private val textureId: Int
 
@@ -801,6 +824,8 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * CPU (no llama a OpenGL), asi que se puede probar en cualquier hilo.
      */
     fun pickUv(ox: Float, oy: Float, oz: Float, dx: Float, dy: Float, dz: Float): FloatArray? {
+        // Con el acelerador listo (ver triBvh) el rayo solo prueba los triangulos de las cajas que atraviesa; si todavia no esta, recorre todos.
+        triBvh?.let { return it.pick(ox, oy, oz, dx, dy, dz, mesh.uvs) }
         val p = mesh.positions
         val uv = mesh.uvs
         var bestT = Float.MAX_VALUE
@@ -849,7 +874,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * capa, se vuelve a componer solo el rectangulo tocado y ese se sube a la GPU con glTexSubImage2D.
      * IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
      */
-    fun paintDab(u: Float, v: Float, radius: Float, r: Int, g: Int, b: Int, opacity: Float = 1f, brushType: BrushType = BrushType.SOFT, erase: Boolean = false) {
+    fun paintDab(u: Float, v: Float, radius: Float, r: Int, g: Int, b: Int, opacity: Float = 1f, brushType: BrushType = BrushType.SOFT, erase: Boolean = false, grain: Float = 0f, grainRadius: Float = 0f) {
         if (released) return
         val layer = selectedLayer() ?: return
         if (layer.isFolder || layer.locked || !layer.visible) return
@@ -869,6 +894,9 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         if (x1 > strokeMaxX) strokeMaxX = x1
         if (y1 > strokeMaxY) strokeMaxY = y1
         strokeDab++
+        // Desplazamiento del grano de ESTE toque (distinto en cada uno, ver mas abajo).
+        val grainOffX = hash01(strokeDab, 7) * 5000f
+        val grainOffY = hash01(strokeDab, 13) * 5000f
         // Antes de tocar un solo pixel: guarda las baldosas que todavia no se guardaron en este trazo (para deshacerlo).
         saveTilesForUndo(layer, x0, y0, x1, y1)
 
@@ -887,7 +915,10 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
 
 
                 }
-                val dabAlpha = falloff * opacity * (if (selMask != null) (selMask[y * texSize + x].toInt() and 0xFF) / 255f else 1f)
+                // Grano: ruido que baja la opacidad en las motas oscuras. Cambia en cada toque (como la punta de ibisPaint, que gira al azar): como en
+                // una pasada se queda el maximo de los toques, eso deja un gris parejo con motas y no el blanco y negro duro de un ruido fijo. grain = 0 = liso.
+                val grainMul = if (grain > 0f && grainRadius > 0f) 1f - grain + grain * grainAt(x, y, grainRadius, grainOffX, grainOffY) else 1f
+                val dabAlpha = falloff * opacity * grainMul * (if (selMask != null) (selMask[y * texSize + x].toInt() and 0xFF) / 255f else 1f)
                 val idx = y * texSize + x
                 var prevAlpha = strokeAlpha[idx]
                 // Pasada nueva: el trazo se fue de este texel y volvio. Se parte del color que tiene ahora (con lo ya pintado) para que se sume.
@@ -1042,6 +1073,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      */
     fun release() {
         released = true
+        triBvh = null
         GLES20.glDeleteBuffers(1, intArrayOf(vbo), 0)
         GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
         GLES20.glDeleteProgram(program)
@@ -1079,6 +1111,108 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         val y = (v * (texSize - 1)).toInt().coerceIn(0, texSize - 1)
         val o = (y * texSize + x) * 4
         return intArrayOf(comp[o].toInt() and 0xFF, comp[o + 1].toInt() and 0xFF, comp[o + 2].toInt() and 0xFF)
+    }
+
+    // ---- Repintar el final de un trazo (desvanecido, ver MyGLRenderer.paintEnd) ----
+
+    /** Numero del ultimo toque del trazo en curso (cada paintDab lo sube en 1). */
+    fun lastDabSerial(): Int = strokeDab
+
+    /**
+     * Pone el numero de toque: el proximo paintDab pasa a ser el toque value + 1. Un toque que se repinta usa el mismo numero que tuvo al
+     * pintarse, asi cae en el mismo grano y en la misma cuenta de pasadas (ver STROKE_NEW_PASS_GAP).
+     */
+    fun setDabSerial(value: Int) {
+        strokeDab = value
+    }
+
+    /**
+     * Quita del trazo en curso lo que pintaron los toques centrados en (us[i], vs[i]) con radio radii[i] (texeles): cada texel de esos circulos
+     * que el trazo toco vuelve al color que tenia antes del trazo y a "sin tocar" (strokeAlpha = 0). Lo usa el desvanecido del final, que despues
+     * repinta esos toques, y los que comparten texeles con ellos, con otra opacidad y tamano. Hilo de render (usa OpenGL).
+     */
+    fun revertStrokeCircles(us: FloatArray, vs: FloatArray, radii: FloatArray) {
+        if (released) return
+        val layer = selectedLayer() ?: return
+        if (layer.isFolder || layer.locked || !layer.visible) return
+        val pix = layer.pixels
+        var minX = texSize
+        var minY = texSize
+        var maxX = -1
+        var maxY = -1
+        for (k in us.indices) {
+            val radius = radii[k]
+            val cx = us[k] * (texSize - 1)
+            val cy = vs[k] * (texSize - 1)
+            val x0 = maxOf(0, Math.floor((cx - radius).toDouble()).toInt())
+            val x1 = minOf(texSize - 1, Math.ceil((cx + radius).toDouble()).toInt())
+            val y0 = maxOf(0, Math.floor((cy - radius).toDouble()).toInt())
+            val y1 = minOf(texSize - 1, Math.ceil((cy + radius).toDouble()).toInt())
+            for (y in y0..y1) {
+                for (x in x0..x1) {
+                    val ddx = x - cx
+                    val ddy = y - cy
+                    if (ddx * ddx + ddy * ddy >= radius * radius) continue
+                    val idx = y * texSize + x
+                    if (strokeAlpha[idx] <= 0f) continue
+                    val o = idx * 4
+                    pix[o] = strokeBase[o]
+                    pix[o + 1] = strokeBase[o + 1]
+                    pix[o + 2] = strokeBase[o + 2]
+                    pix[o + 3] = strokeBase[o + 3]
+                    strokeAlpha[idx] = 0f
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        if (maxX < minX) return
+        recompositeRect(minX, minY, maxX, maxY)
+        uploadRect(minX, minY, maxX, maxY)
+    }
+
+    // ---- Grano ----
+
+    /** Numero pseudoaleatorio fijo (0..1) para la celda (ix, iy) de una rejilla de ruido. */
+    private fun hash01(ix: Int, iy: Int): Float {
+        var h = ix * 374761393 + iy * 668265263
+        h = (h xor (h ushr 13)) * 1274126177
+        h = h xor (h ushr 16)
+        return (h and 0xFFFFFF) / 16777216f
+    }
+
+    /** Ruido de valores (0..1) con celdas de cell texeles, suavizado entre celdas. */
+    private fun valueNoise(x: Float, y: Float, cell: Float): Float {
+        val gx = x / cell
+        val gy = y / cell
+        val ix = Math.floor(gx.toDouble()).toInt()
+        val iy = Math.floor(gy.toDouble()).toInt()
+        val fx = gx - ix
+        val fy = gy - iy
+        val sx = fx * fx * (3f - 2f * fx)
+        val sy = fy * fy * (3f - 2f * fy)
+        val a = hash01(ix, iy)
+        val b = hash01(ix + 1, iy)
+        val c = hash01(ix, iy + 1)
+        val d = hash01(ix + 1, iy + 1)
+        return (a * (1f - sx) + b * sx) * (1f - sy) + (c * (1f - sx) + d * sx) * sy
+    }
+
+    /**
+     * Grano de carbon en el texel (x, y): 0..1 con promedio 0.5. Mezcla dos escalas de ruido (motas de 0.3 del radio y variaciones
+     * mas lentas de 0.6) y le baja el contraste. Los tamanos y el contraste salen de medir el centro de un trazo de Carboncillo de ibisPaint
+     * (opacidad de 0.24 a 0.72, media 0.49, motas redondas de unos 5 px en un trazo de 25 px). radius = radio nominal del pincel en texeles
+     * (escala el grano con el pincel); offX, offY desplazan el ruido y cambian en cada toque (ver paintDab).
+     */
+    private fun grainAt(x: Int, y: Int, radius: Float, offX: Float, offY: Float): Float {
+        val xf = x + offX
+        val yf = y + offY
+        val n = 0.6f * valueNoise(xf, yf, maxOf(0.5f, radius * 0.3f)) +
+            0.4f * valueNoise(xf + 917f, yf + 331f, maxOf(0.5f, radius * 0.6f))
+        // (dos escalas de ruido: motas de 0.3 del radio y variaciones mas lentas de 0.6)
+        return ((n - 0.5f) * 2.0f + 0.5f).coerceIn(0f, 1f)
     }
 
     // ---- Relleno ----

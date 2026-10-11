@@ -22,6 +22,7 @@ import android.widget.Toast
 
 private const val REQ_IMPORT_OBJ = 4101
 private const val REQ_EXPORT_PNG = 4102
+private const val REQ_IMPORT_BRUSH_QR = 4103
 
 /**
  * Pantalla unica de la app de pintura: vista 3D (un dedo pinta, dos dedos mueven la camara y el pellizco hace zoom),
@@ -55,6 +56,8 @@ class MainActivity : Activity() {
         // Pintar usa OpenGL: los eventos de la vista pasan al hilo de render.
         glView.onPaintStart = { x, y -> glView.queueEvent { glView.renderer.paintStart(x, y) } }
         glView.onPaintMove = { x, y -> glView.queueEvent { glView.renderer.paintMove(x, y) } }
+        // Al soltar el dedo (o llegar un segundo dedo / cancelarse el gesto): los pinceles con desvanecido al final pintan ahi sus ultimos toques.
+        glView.onPaintEnd = { glView.queueEvent { glView.renderer.paintEnd() } }
 
         val root = FrameLayout(this)
         root.addView(
@@ -96,6 +99,8 @@ class MainActivity : Activity() {
             glView.isLocked = locked
             locked
         }
+        // Menu de los 3 puntitos de la lista de pinceles > Importar codigo QR: aca se elige la imagen (ver onActivityResult / importBrushFromQr).
+        paintPanel.onImportBrushQr = { openBrushQrPicker() }
         root.addView(paintPanel, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
@@ -441,6 +446,34 @@ class MainActivity : Activity() {
         return diff
     }
 
+    /** Lista de pinceles > Importar codigo QR: abre el selector del sistema para elegir la imagen (captura) del QR de un pincel de ibisPaint. */
+    private fun openBrushQrPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.type = "image/*"
+        startActivityForResult(intent, REQ_IMPORT_BRUSH_QR)
+    }
+
+    /** Ya hay imagen (uri): busca el QR, lee el pincel y lo agrega a la lista. Leer la imagen puede tardar, asi que va en un hilo aparte. */
+    private fun importBrushFromQr(uri: Uri) {
+        Toast.makeText(this, "Leyendo el código QR...", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val bytes = QrImageReader.readBytes(contentResolver, uri)
+                val brush = IbisBrush.fromQrBytes(bytes)
+                runOnUiThread {
+                    paintPanel.importIbisBrush(brush)
+                    Toast.makeText(this, "Pincel importado: " + brush.displayName, Toast.LENGTH_LONG).show()
+                }
+            } catch (ex: IllegalArgumentException) {
+                // Mensajes pensados para mostrar (no es un QR de ibisPaint, imagen sin QR, datos incompletos...).
+                runOnUiThread { Toast.makeText(this, ex.message ?: "No se pudo importar el pincel", Toast.LENGTH_LONG).show() }
+            } catch (ex: Exception) {
+                runOnUiThread { Toast.makeText(this, "Error al importar el pincel: " + ex.message, Toast.LENGTH_LONG).show() }
+            }
+        }.start()
+    }
+
     /** File > Import: abre el selector de archivos del sistema para elegir un .obj (ver onActivityResult). */
     private fun openObjPicker() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
@@ -452,6 +485,11 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_IMPORT_BRUSH_QR) {
+            val uri = data?.data
+            if (resultCode == RESULT_OK && uri != null) importBrushFromQr(uri)
+            return
+        }
         if (requestCode == REQ_EXPORT_PNG) {
             // Si cancelo el selector, se olvida lo que estaba pendiente.
             val uri = data?.data
