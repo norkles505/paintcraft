@@ -292,6 +292,7 @@ class MainActivity : Activity() {
         showExportDialog()
     }
 
+
     // ---- Exportar PNG ----
 
     /** File > Export: pregunta que sacar (textura completa con o sin fondo, o solo la capa elegida). */
@@ -330,7 +331,9 @@ class MainActivity : Activity() {
         }
         pendingExport = kind
         pendingExportLayerId = if (kind == ExportKind.LAYER) geo.selectedLayerId else -1
-        val fileName = if (kind == ExportKind.LAYER) "paintcraft_capa.png" else "paintcraft_textura.png"
+        // Con el modelo separado en piezas se exporta la pieza activa: su nombre va en el archivo.
+        val pieceName = if (glView.renderer.pieces().size >= 2) glView.renderer.activeObject()?.name?.takeIf { it.isNotEmpty() }?.replace(Regex("[^A-Za-z0-9_-]"), "_") else null
+        val fileName = (if (kind == ExportKind.LAYER) "paintcraft_capa" else "paintcraft_textura") + (if (pieceName != null) "_" + pieceName else "") + ".png"
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
         intent.addCategory(Intent.CATEGORY_OPENABLE)
         intent.type = "image/png"
@@ -508,11 +511,16 @@ class MainActivity : Activity() {
             try {
                 val stream = contentResolver.openInputStream(uri) ?: throw IllegalArgumentException("No se pudo abrir el archivo")
                 val mesh = stream.use { ObjLoader.load(it, 1f) }
+                // Un modelo con varias partes (lineas o/g) se separa en piezas: cada una con su propia textura y capas.
+                val pieces = ObjLoader.splitParts(mesh)
                 runOnUiThread {
-                    glView.renderer.addImportedMesh(mesh)
+                    if (pieces.size >= 2) glView.renderer.addImportedMeshes(pieces) else glView.renderer.addImportedMesh(mesh)
                     glView.requestRender()
                     val uvInfo = if (mesh.hasUvs) "con UVs" else "SIN UVs"
-                    Toast.makeText(this, "Importado: " + mesh.triangleCount + " triangulos, " + uvInfo, Toast.LENGTH_LONG).show()
+                    val partInfo = if (pieces.size >= 2) ", " + pieces.size + " piezas, cada una con su textura (botón del cubo en el panel de capas)"
+                    else if (mesh.parts.size >= 2) ", " + mesh.parts.size + " partes (más de " + ObjLoader.MAX_PIECES + ": comparten una sola textura)"
+                    else ""
+                    Toast.makeText(this, "Importado: " + mesh.triangleCount + " triangulos, " + uvInfo + partInfo, Toast.LENGTH_LONG).show()
                 }
             } catch (ex: Exception) {
                 runOnUiThread { Toast.makeText(this, "Error al importar: " + ex.message, Toast.LENGTH_LONG).show() }

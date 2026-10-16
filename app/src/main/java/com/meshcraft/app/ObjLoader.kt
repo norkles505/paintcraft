@@ -10,9 +10,28 @@ class ObjMesh(
     val positions: FloatArray,
     val normals: FloatArray,
     val uvs: FloatArray,
-    val hasUvs: Boolean
+    val hasUvs: Boolean,
+    /** Partes del modelo (lineas o/g del OBJ), cada una un tramo seguido de vertices. Vacio si el OBJ no trae partes (o trae una sola). Cubren toda la malla sin huecos. */
+    val parts: List<MeshPart> = emptyList()
 ) {
     val vertexCount: Int get() = positions.size / 3
+    val triangleCount: Int get() = vertexCount / 3
+
+    /**
+     * Si cada parte se ve (misma posicion que en parts). La interfaz los cambia (ver MyGLRenderer.setPartVisible) y el hilo de
+     * render los lee al dibujar y al pintar: una parte oculta no se dibuja ni se puede pintar.
+     */
+    val partVisible = BooleanArray(parts.size) { true }
+
+    /**
+     * Orden en que salen las partes en la lista del panel: partOrder[posicion en la lista] = indice de la parte. Lo cambia el asa de cada
+     * fila. OJO: solo cambia la lista, no el modelo ni la pintura (a diferencia de las capas, el orden de las partes no afecta a nada).
+     */
+    val partOrder = IntArray(parts.size) { it }
+}
+
+/** Una parte de un modelo: un nombre y el tramo de vertices [firstVertex, firstVertex + vertexCount) de la malla (multiplo de 3: triangulos completos). */
+class MeshPart(val name: String, val firstVertex: Int, val vertexCount: Int) {
     val triangleCount: Int get() = vertexCount / 3
 }
 
@@ -27,7 +46,8 @@ private class FloatBuf {
 
 /**
  * Lector de archivos Wavefront OBJ (v, vt, vn, f). Triangula poligonos en abanico, soporta indices negativos,
- * y calcula normales planas si el archivo no las trae. Ignora materiales, grupos y suavizado.
+ * y calcula normales planas si el archivo no las trae. Ignora materiales y suavizado. Las lineas "o" y "g" parten el modelo en
+ * partes (ver ObjMesh.parts): cada parte es un tramo seguido de la malla, que sigue siendo UNA sola malla con UNA sola textura.
  * fitSize > 0: centra el modelo en el origen y lo escala para que su lado mas largo mida fitSize.
  * yUp = true (por defecto): el OBJ viene con Y arriba (estandar, y lo que exporta Blender por defecto) y se convierte a Z arriba.
  */
@@ -40,6 +60,31 @@ object ObjLoader {
         return r
     }
 
+    /** Maximo de piezas en que se separa un modelo: cada una lleva su propia textura, capas e historial y pesa varios MB, asi que con mas partes que esto el modelo se queda como una sola malla. */
+    const val MAX_PIECES = 12
+
+    /**
+     * Parte un modelo con partes (lineas o/g) en una malla por parte, cada una con su nombre y sin partes propias. Cada una se pinta con su
+     * PROPIA textura y capas (ver MyGLRenderer.addImportedMeshes), asi las piezas que usan la misma zona del mapa UV no se pisan. Las posiciones
+     * no cambian, asi que todas quedan juntas como en el modelo original. Con menos de 2 partes, o mas de MAX_PIECES, devuelve la malla tal cual.
+     */
+    fun splitParts(mesh: ObjMesh): List<Pair<String, ObjMesh>> {
+        if (mesh.parts.size < 2 || mesh.parts.size > MAX_PIECES) return listOf(Pair("Modelo", mesh))
+        val result = ArrayList<Pair<String, ObjMesh>>()
+        for (part in mesh.parts) {
+            val a = part.firstVertex
+            val b = part.firstVertex + part.vertexCount
+            val piece = ObjMesh(
+                mesh.positions.copyOfRange(a * 3, b * 3),
+                mesh.normals.copyOfRange(a * 3, b * 3),
+                mesh.uvs.copyOfRange(a * 2, b * 2),
+                mesh.hasUvs
+            )
+            result.add(Pair(part.name, piece))
+        }
+        return result
+    }
+
     fun load(input: InputStream, fitSize: Float = 2f, yUp: Boolean = true): ObjMesh {
         val pos = FloatBuf()
         val tex = FloatBuf()
@@ -49,6 +94,9 @@ object ObjLoader {
         val outT = FloatBuf()
         var anyUv = false
         var lineNo = 0
+        // Partes: en que vertice de salida empieza cada una (las lineas o/g) y su nombre. Las vacias se descartan al final.
+        val partStarts = ArrayList<Int>()
+        val partNames = ArrayList<String>()
 
         input.bufferedReader().useLines { lines ->
             for (raw in lines) {
@@ -57,6 +105,11 @@ object ObjLoader {
                 if (line.isEmpty() || line.startsWith("#")) continue
                 val parts = line.split(WS)
                 when (parts[0]) {
+                    "o", "g" -> {
+                        val name = parts.drop(1).joinToString(" ").ifEmpty { "Parte " + (partNames.size + 1) }
+                        partStarts.add(outP.size / 3)
+                        partNames.add(name)
+                    }
                     "v" -> {
                         if (parts.size < 4) throw IllegalArgumentException("Linea " + lineNo + ": vertice incompleto")
                         val vx = parts[1].toFloat(); val vy = parts[2].toFloat(); val vz = parts[3].toFloat()
@@ -142,6 +195,21 @@ object ObjLoader {
             }
         }
 
-        return ObjMesh(outP.data.copyOf(outP.size), outN.data.copyOf(outN.size), outT.data.copyOf(outT.size), anyUv)
+        // Partes: cada linea o/g abre un tramo que llega hasta la siguiente. Los tramos vacios (un "o" seguido de un "g") se descartan, y las
+        // caras que vinieran antes de la primera linea forman una parte propia, asi las partes cubren toda la malla sin huecos.
+        val totalVertices = outP.size / 3
+        val meshParts = ArrayList<MeshPart>()
+        if (partStarts.isNotEmpty()) {
+            if (partStarts[0] > 0) meshParts.add(MeshPart("Sin nombre", 0, partStarts[0]))
+            for (k in partStarts.indices) {
+                val from = partStarts[k]
+                val to = if (k + 1 < partStarts.size) partStarts[k + 1] else totalVertices
+                if (to > from) meshParts.add(MeshPart(partNames[k], from, to - from))
+            }
+        }
+        // Con una sola parte no hay nada que separar: el modelo se comporta como siempre.
+        val finalParts = if (meshParts.size >= 2) meshParts else emptyList()
+
+        return ObjMesh(outP.data.copyOf(outP.size), outN.data.copyOf(outN.size), outT.data.copyOf(outT.size), anyUv, finalParts)
     }
 }

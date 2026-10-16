@@ -296,6 +296,8 @@ private class ThumbView(context: Context, private val kind: ThumbKind, var chose
  * opacidad, bloqueo alfa, carpetas (crear, plegar, arrastrar capas adentro y afuera, ver computeDrop) y, en los tres puntitos,
  * renombrar, bloquear, Modo Solo y guardar la capa como PNG transparente (el selector de archivos lo abre MainActivity.startExport).
  * Pinta siempre la capa elegida.
+ * Boton del cubo (arriba de "Anadir capa"): cambia la lista a las PARTES del modelo (las lineas o/g de su OBJ), cada una con ojo (mostrar/ocultar)
+ * y asa (mover en la lista); en ese modo no se ven las capas ni sus controles (ver togglePartsView, applyMode y buildPartsList).
  * Selecciona la opacidad (tres puntitos) marca lo pintado de la capa elegida (ver TexturedMeshGeometry.selectByOpacity): despues solo se pinta dentro; se quita tocando la fila "Capa de selección". Sin modelo importado la lista sale vacia.
  *
  * Los ajustes simples (ojo, nombre, opacidad, candados) se cambian directo desde la interfaz; lo que toca pixeles o la lista
@@ -326,6 +328,18 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
     private val listBox = LinearLayout(context)
     // Texto del modo de mezcla de la capa elegida (en el cuadro de abajo a la derecha). Se actualiza en rebuildList.
     private val blendLabel = label("Normal", 15f, darkText)
+    // Titulo de arriba: "Capa", o "Partes" en el modo Partes.
+    private val titleLabel = label("Capa", 18f, Color.WHITE).apply {
+        maxLines = 1
+        ellipsize = android.text.TextUtils.TruncateAt.END
+    }
+    // Modo del panel: false = lista de capas, true = lista de las partes del modelo (boton del cubo, ver togglePartsView).
+    private var showingParts = false
+    // Boton del cubo (se resalta en naranja en el modo Partes) y barra de abajo (modo de mezcla), que se esconde en el modo Partes.
+    private lateinit var partsButton: View
+    private lateinit var bottomControls: View
+    // Filas de botones que solo sirven para las capas (anadir, clonar, carpeta): se esconden en el modo Partes, junto con la columna de acciones, la barra de abajo y la opacidad.
+    private val layerOnlyViews = ArrayList<View>()
     // Slider de opacidad de la capa elegida (abajo del todo).
     private val opacityRow: IbisSliderRow = IbisSliderRow(context, 100, 100, 1, true, { it.toString() + "%" }) { v -> onOpacityChanged(v) }
     // Texto "NN%" de la fila de la capa elegida, para ponerlo al dia mientras se mueve el slider sin armar toda la lista.
@@ -340,7 +354,7 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
         }
         setPadding(dp(7), dp(9), dp(7), dp(8))
 
-        addView(label("Capa", 18f, Color.WHITE), LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+        addView(titleLabel, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
             bottomMargin = dp(13)
         })
 
@@ -352,7 +366,8 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
         middle.addView(actionsColumn, LayoutParams(dp(35), LayoutParams.MATCH_PARENT))
         addView(middle, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
 
-        addView(buildBottomControls(), LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+        bottomControls = buildBottomControls()
+        addView(bottomControls, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(4)
         })
 
@@ -441,6 +456,15 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
             cornerRadii = floatArrayOf(0f, 0f, 0f, 0f, 0f, 0f, 6 * d, 6 * d)
             setColor(Color.BLACK)
         }
+        // Cubo: cambia la lista entre las capas y las partes del modelo (ver togglePartsView). Va arriba de "Anadir capa".
+        val cubeRow = LinearLayout(context)
+        cubeRow.orientation = HORIZONTAL
+        cubeRow.gravity = Gravity.CENTER_HORIZONTAL
+        partsButton = drawableButton(R.drawable.ic_mesh_cube, 40, Color.WHITE, "Partes")
+        partsButton.setOnClickListener { togglePartsView() }
+        cubeRow.addView(partsButton)
+        block.addView(cubeRow)
+
         val rows = listOf(
             listOf(Pair(LayerIcon.ADD, "Añadir capa")),
             listOf(Pair(LayerIcon.DUPLICATE, "Clonar capa")),
@@ -449,6 +473,7 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
         for (items in rows) {
             val row = LinearLayout(context)
             row.orientation = HORIZONTAL
+            layerOnlyViews.add(row)
             for ((icon, name) in items) {
                 val res = when (icon) {
                     LayerIcon.ADD -> R.drawable.ic_layer_add
@@ -610,8 +635,14 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
     }
 
     private fun doRebuildList() {
+        applyMode()
         listBox.removeAllViews()
         selectedOpacityLabel = null
+        // Modo Partes: solo la lista de partes del modelo, sin capas.
+        if (showingParts) {
+            buildPartsList()
+            return
+        }
         val g = geo()
         val sel = g?.selectedLayer()
         blendLabel.text = sel?.blendMode?.label ?: BlendMode.NORMAL.label
@@ -636,6 +667,221 @@ class LayersPanel(context: Context, private val renderer: MyGLRenderer) : Linear
             listBox.addView(if (layer.isFolder) buildFolderRow(g, layer).also { addFolderHandle(g, layer, it as LinearLayout) } else buildLayerRow(g, layer))
             listBox.addView(divider())
         }
+    }
+
+    // ---- Partes del modelo ----
+
+    /**
+     * Boton del cubo: cambia el panel entre la lista de capas y la lista de partes del modelo (las lineas o/g de su OBJ). Si el modelo no
+     * tiene partes (menos de 2) avisa y no cambia. Al volver a las capas, todo queda como estaba.
+     */
+    private fun togglePartsView() {
+        if (!showingParts) {
+            val mesh = renderer.activeMesh
+            if (mesh == null) {
+                toast("Importa un modelo para ver sus partes")
+                return
+            }
+            if (mesh.parts.size < 2 && renderer.pieces().size < 2) {
+                toast("Este modelo no trae partes separadas (su OBJ no tiene líneas o/g)")
+                return
+            }
+        }
+        showingParts = !showingParts
+        rebuildList()
+    }
+
+    /**
+     * Pone el panel en el modo que toca: en el modo Partes se esconden los controles que solo sirven para las capas (anadir, clonar, carpeta,
+     * columna de acciones, modo de mezcla y opacidad), el titulo pasa a "Partes" y el cubo se resalta en naranja. El cubo siempre queda visible.
+     */
+    private fun applyMode() {
+        val layerControls = if (showingParts) View.GONE else View.VISIBLE
+        for (v in layerOnlyViews) v.visibility = layerControls
+        actionsColumn.visibility = layerControls
+        bottomControls.visibility = layerControls
+        opacityRow.visibility = layerControls
+        // Con el modelo separado en piezas, el titulo dice de cual son las capas que se ven (la pieza activa).
+        val activePiece = if (renderer.pieces().size >= 2) renderer.activeObject()?.name?.takeIf { it.isNotEmpty() } else null
+        titleLabel.text = if (showingParts) "Partes" else if (activePiece != null) "Capa · " + activePiece else "Capa"
+        partsButton.background = if (showingParts) highlight() else null
+        // Aviso: en la vista de capas, el cubo sale naranja si hay alguna parte oculta (para no olvidarlo).
+        val anyHidden = renderer.activeMesh?.partVisible?.any { !it } == true || renderer.pieces().any { !it.visible }
+        (partsButton as ImageView).setColorFilter(if (anyHidden && !showingParts) accent else Color.WHITE)
+    }
+
+    /**
+     * Lista de partes (modo Partes): cada fila con el cubo, el nombre, cuantos triangulos tiene, un ojo para mostrarla u ocultarla y un asa para
+     * moverla en la lista. Una parte oculta no se dibuja ni se puede pintar (sirve para llegar a las que quedan tapadas). Todas las partes
+     * comparten la misma textura y las mismas capas: ocultar no borra nada de lo pintado.
+     */
+    private fun buildPartsList() {
+        val mesh = renderer.activeMesh
+        // Modelo separado en piezas (cada una con su propia textura y capas): la lista son las piezas.
+        val pieces = renderer.pieces()
+        if (pieces.size >= 2) {
+            for (piece in pieces) {
+                listBox.addView(buildPieceRow(piece))
+                listBox.addView(divider())
+            }
+            return
+        }
+        if (mesh == null || mesh.parts.size < 2) {
+            val msg = label("Este modelo no trae partes separadas.", 14f, darkText)
+            msg.setPadding(dp(12), dp(16), dp(12), dp(16))
+            listBox.addView(msg)
+            return
+        }
+        for (index in mesh.partOrder.toList()) {
+            listBox.addView(buildPartRow(mesh, index))
+            listBox.addView(divider())
+        }
+    }
+
+    /**
+     * Fila de una pieza (el modelo se separo en piezas, cada una con su propia textura y capas): cubo, nombre, ojo y cantidad de triangulos. La
+     * pieza activa (la de las capas que se ven) va resaltada en azul. Tocar la fila la elige y vuelve a la lista de capas; el ojo la muestra u oculta
+     * (una pieza oculta no se dibuja ni se puede pintar; lo pintado no se borra).
+     */
+    private fun buildPieceRow(piece: SceneObject): View {
+        val active = renderer.activeObject()?.id == piece.id
+        val visible = piece.visible
+        val row = LinearLayout(context)
+        row.orientation = HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dp(6), dp(3), dp(6), dp(3))
+        row.setBackgroundColor(if (active) selectedBg else Color.TRANSPARENT)
+        row.isClickable = true
+        row.setOnClickListener {
+            renderer.activeObjectId = piece.id
+            showingParts = false
+            rebuildList()
+        }
+
+        val icon = ImageView(context)
+        icon.setImageResource(R.drawable.ic_mesh_cube)
+        icon.setColorFilter(Color.rgb(115, 115, 115))
+        icon.scaleType = ImageView.ScaleType.FIT_CENTER
+        icon.alpha = if (visible) 1f else 0.45f
+        row.addView(icon, LayoutParams(dp(40), dp(40)))
+
+        val info = LinearLayout(context)
+        info.orientation = VERTICAL
+        info.alpha = if (visible) 1f else 0.45f
+        val name = compactLabel(piece.name.ifEmpty { "Pieza" }, 17f, darkText)
+        name.maxLines = 1
+        name.ellipsize = android.text.TextUtils.TruncateAt.END
+        info.addView(name, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        val middle = LinearLayout(context)
+        middle.orientation = HORIZONTAL
+        middle.gravity = Gravity.CENTER_VERTICAL
+        val eye = LayerIconView(context, LayerIcon.EYE, Color.rgb(115, 115, 115))
+        eye.setPadding(dp(1), 0, dp(1), 0)
+        eye.layoutParams = LayoutParams(dp(30), dp(26))
+        eye.isClickable = true
+        eye.setOnClickListener {
+            renderer.setObjectVisible(piece.id, !piece.visible)
+            rebuildList()
+        }
+        middle.addView(eye)
+        middle.addView(View(context), LayoutParams(0, 1, 1f))
+        middle.addView(compactLabel((piece.importedMesh?.triangleCount ?: 0).toString() + " tri", 14f, darkText))
+        info.addView(middle, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        row.addView(info, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(4) })
+        return row
+    }
+
+    /** Fila de una parte, parecida a la de una capa: cubo, nombre, ojo + cantidad de triangulos, y asa. Oculta se ve atenuada. */
+    private fun buildPartRow(mesh: ObjMesh, index: Int): View {
+        val part = mesh.parts[index]
+        val visible = mesh.partVisible[index]
+        val row = LinearLayout(context)
+        row.orientation = HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dp(6), dp(3), dp(6), dp(3))
+        row.isClickable = true
+
+        val icon = ImageView(context)
+        icon.setImageResource(R.drawable.ic_mesh_cube)
+        icon.setColorFilter(Color.rgb(115, 115, 115))
+        icon.scaleType = ImageView.ScaleType.FIT_CENTER
+        icon.alpha = if (visible) 1f else 0.45f
+        row.addView(icon, LayoutParams(dp(40), dp(40)))
+
+        val info = LinearLayout(context)
+        info.orientation = VERTICAL
+        info.alpha = if (visible) 1f else 0.45f
+        val name = compactLabel(part.name, 17f, darkText)
+        name.maxLines = 1
+        name.ellipsize = android.text.TextUtils.TruncateAt.END
+        info.addView(name, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        val middle = LinearLayout(context)
+        middle.orientation = HORIZONTAL
+        middle.gravity = Gravity.CENTER_VERTICAL
+        val eye = LayerIconView(context, LayerIcon.EYE, Color.rgb(115, 115, 115))
+        eye.setPadding(dp(1), 0, dp(1), 0)
+        eye.layoutParams = LayoutParams(dp(30), dp(26))
+        eye.isClickable = true
+        eye.setOnClickListener { togglePart(mesh, index) }
+        middle.addView(eye)
+        middle.addView(View(context), LayoutParams(0, 1, 1f))
+        middle.addView(compactLabel(part.triangleCount.toString() + " tri", 14f, darkText))
+        info.addView(middle, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        row.addView(info, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(4) })
+
+        // Asa: se arrastra hacia arriba o abajo y al soltar la parte queda en esa posicion de la lista.
+        val handle = iconButton(LayerIcon.HANDLE, 40, Color.rgb(150, 150, 150), "Reordenar partes")
+        handle.setOnTouchListener(partDragListener(mesh, index, row))
+        row.addView(handle)
+        return row
+    }
+
+    /** Muestra u oculta una parte y vuelve a armar la lista. La vista 3D se redibuja sola (dibuja todo el tiempo). */
+    private fun togglePart(mesh: ObjMesh, index: Int) {
+        renderer.setPartVisible(mesh, index, !mesh.partVisible[index])
+        rebuildList()
+    }
+
+    /** Listener del asa de una fila de parte: arrastra la fila y al soltar la mueve en la lista (ver movePart). */
+    private fun partDragListener(mesh: ObjMesh, index: Int, row: View): View.OnTouchListener =
+        object : View.OnTouchListener {
+            private var startY = 0f
+
+            override fun onTouch(v: View, event: android.view.MotionEvent): Boolean {
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        startY = event.rawY
+                        v.parent.requestDisallowInterceptTouchEvent(true)
+                        row.translationZ = 8 * d
+                        row.setBackgroundColor(lightBg)
+                        return true
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        row.translationY = event.rawY - startY
+                        return true
+                    }
+                    android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                        val dy = event.rawY - startY
+                        row.translationY = 0f
+                        row.translationZ = 0f
+                        val steps = Math.round(dy / (row.height + 1).coerceAtLeast(1))
+                        if (event.actionMasked == android.view.MotionEvent.ACTION_UP && steps != 0) movePart(mesh, index, steps)
+                        rebuildList()
+                        return true
+                    }
+                }
+                return false
+            }
+        }
+
+    /** Mueve la parte steps puestos en la lista (positivo = hacia abajo, negativo = hacia arriba). Solo cambia el orden de la lista, no el modelo ni la pintura. */
+    private fun movePart(mesh: ObjMesh, index: Int, steps: Int) {
+        val order = mesh.partOrder.toMutableList()
+        val from = order.indexOf(index)
+        if (from < 0) return
+        order.removeAt(from)
+        order.add((from + steps).coerceIn(0, order.size), index)
+        for (k in order.indices) mesh.partOrder[k] = order[k]
     }
 
     /** Fila fija de arriba: la capa de seleccion. Titulo, icono punteado y "No seleccionado", uno debajo del otro. */

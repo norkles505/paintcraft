@@ -157,8 +157,9 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
     // Trazo en curso (ver beginStroke / paintDab): strokeAlpha = la mayor opacidad aplicada a cada texel en la pasada actual
     // (0 = sin tocar), strokeBase = color RGBA que tenia cada texel de la capa ANTES del trazo. Cada toque se mezcla con ese
     // color original usando el maximo de los alphas, asi los toques seguidos de una misma pasada no acumulan opacidad (una pasada nunca pasa de la opacidad elegida), pero volver a pasar por el mismo lugar suma.
-    private val strokeAlpha = FloatArray(texSize * texSize)
-    private val strokeBase = ByteArray(texSize * texSize * 4)
+    // Se crean la primera vez que se usan (by lazy): con el modelo separado en piezas, las que nunca se pintan no gastan esta memoria (12 MB por pieza).
+    private val strokeAlpha: FloatArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(texSize * texSize) }
+    private val strokeBase: ByteArray by lazy(LazyThreadSafetyMode.NONE) { ByteArray(texSize * texSize * 4) }
     // Rectangulo (en texeles) que toco el trazo, para limpiar strokeAlpha sin recorrer toda la textura.
     private var strokeMinX = texSize
     private var strokeMinY = texSize
@@ -166,7 +167,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
     private var strokeMaxY = -1
     // Numero de toque dentro del trazo y, por texel, el ultimo toque que lo toco: si pasan mas de STROKE_NEW_PASS_GAP toques
     // sin tocarlo, el trazo se fue y volvio (cruce sobre si mismo) y esa vuelta cuenta como una pasada nueva que se suma.
-    private val strokeLastDab = IntArray(texSize * texSize)
+    private val strokeLastDab: IntArray by lazy(LazyThreadSafetyMode.NONE) { IntArray(texSize * texSize) }
     private var strokeDab = 0
     private val STROKE_NEW_PASS_GAP = 3
 
@@ -254,7 +255,158 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      */
     @Volatile private var triBvh: TriBvh? = null
 
+    /**
+     * Mapa de islas UV: por cada texel de la textura, el numero (1, 2, 3...) de la isla UV (grupo de triangulos unidos por sus UVs) que lo cubre,
+     * o 0 si no lo cubre ninguna. Sirve para que el pincel solo pinte dentro de la isla que se toco y no se derrame a otras piezas del mapa
+     * UV que quedan cerca en la imagen aunque en el modelo 3D esten lejos. Se arma en un hilo aparte (ver init); mientras sea null el pincel no se limita.
+     */
+    @Volatile private var islandMap: IntArray? = null
+
+    @Volatile private var islandBuildStarted = false
+
+    /**
+     * El mapa de islas UV (ver islandMap), o null si todavia no esta listo. La primera vez que se pinta empieza a armarlo en un hilo aparte (con
+     * prioridad baja); mientras tanto el pincel no se limita a una isla. Las piezas que nunca se pintan no lo arman ni gastan sus 4 MB.
+     */
+    private fun islandMapOrBuild(): IntArray? {
+        islandMap?.let { return it }
+        if (!islandBuildStarted && !released) {
+            islandBuildStarted = true
+            Thread {
+                try {
+                    val map = buildIslandMap()
+                    if (!released) islandMap = map
+                } catch (e: Throwable) {
+                    // Sin memoria u otro problema: el pincel sigue sin limitarse a la isla.
+                }
+            }.apply {
+                name = "island-build"
+                isDaemon = true
+                priority = Thread.MIN_PRIORITY
+            }.start()
+        }
+        return null
+    }
+
+    /** Isla UV (ver islandMap) del texel donde cae el punto (cx, cy) en texeles. 0 = ninguna (el pincel no se limita). */
+    private fun islandAt(map: IntArray, cx: Float, cy: Float): Int {
+        val x = Math.round(cx).coerceIn(0, texSize - 1)
+        val y = Math.round(cy).coerceIn(0, texSize - 1)
+        return map[y * texSize + x]
+    }
+
+    /**
+     * Arma el mapa de islas UV (ver islandMap). Dos triangulos son de la misma isla si comparten un vertice UV (misma posicion en el mapa);
+     * se agrupan con union-find. Despues cada triangulo se pinta en el mapa con el numero de su isla y se agregan 2 texeles de margen
+     * alrededor de cada isla para que el pincel llegue hasta el borde. No usa OpenGL: se puede llamar desde cualquier hilo.
+     */
+    private fun buildIslandMap(): IntArray {
+        val size = texSize
+        val map = IntArray(size * size)
+        val triCount = vertexCount / 3
+        // Los indices de triangulo se guardan en 24 bits dentro de la clave: con mas de 16 millones de triangulos no se arma (el pincel queda sin limite).
+        if (triCount == 0 || triCount >= (1 shl 24)) return map
+        val uv = mesh.uvs
+        val parent = IntArray(triCount) { it }
+        fun find(a: Int): Int {
+            var x = a
+            while (parent[x] != x) {
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            }
+            return x
+        }
+        // Clave de cada vertice: UV cuantizado a 20 bits por eje + triangulo al que pertenece. Ordenadas, los vertices con el mismo UV quedan juntos.
+        val keys = LongArray(triCount * 3)
+        val scale = 1048575f
+        for (i in 0 until triCount * 3) {
+            val qu = Math.round(uv[i * 2] * scale).toLong() and 0xFFFFF
+            val qv = Math.round(uv[i * 2 + 1] * scale).toLong() and 0xFFFFF
+            keys[i] = (qu shl 44) or (qv shl 24) or (i / 3).toLong()
+        }
+        java.util.Arrays.sort(keys)
+        var k = 0
+        while (k < keys.size) {
+            val head = keys[k] ushr 24
+            val firstTri = (keys[k] and 0xFFFFFF).toInt()
+            var j = k + 1
+            while (j < keys.size && (keys[j] ushr 24) == head) {
+                val a = find(firstTri)
+                val b = find((keys[j] and 0xFFFFFF).toInt())
+                if (a != b) parent[b] = a
+                j++
+            }
+            k = j
+        }
+        // Cada triangulo se pinta en el mapa con el numero de su isla.
+        val maxC = (size - 1).toFloat()
+        for (t in 0 until triCount) {
+            val i = t * 3
+            val ax = uv[i * 2] * maxC; val ay = uv[i * 2 + 1] * maxC
+            val bx = uv[(i + 1) * 2] * maxC; val by = uv[(i + 1) * 2 + 1] * maxC
+            val cx = uv[(i + 2) * 2] * maxC; val cy = uv[(i + 2) * 2 + 1] * maxC
+            val denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+            if (denom > -1e-9f && denom < 1e-9f) continue
+            val id = find(t) + 1
+            val minX = maxOf(0, Math.floor(minOf(ax, bx, cx).toDouble()).toInt())
+            val maxX = minOf(size - 1, Math.ceil(maxOf(ax, bx, cx).toDouble()).toInt())
+            val minY = maxOf(0, Math.floor(minOf(ay, by, cy).toDouble()).toInt())
+            val maxY = minOf(size - 1, Math.ceil(maxOf(ay, by, cy).toDouble()).toInt())
+            for (y in minY..maxY) {
+                for (x in minX..maxX) {
+                    val w0 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / denom
+                    val w1 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / denom
+                    val w2 = 1f - w0 - w1
+                    if (w0 >= 0f && w1 >= 0f && w2 >= 0f) map[y * size + x] = id
+                }
+            }
+        }
+        // Margen de 2 texeles: los texeles vacios junto a una isla toman su numero (los ya cubiertos no cambian), cierran las rendijas entre triangulos y dejan pintar hasta el borde.
+        repeat(2) {
+            val src = map.copyOf()
+            for (y in 0 until size) {
+                for (x in 0 until size) {
+                    if (src[y * size + x] != 0) continue
+                    var found = 0
+                    for (ny in maxOf(0, y - 1)..minOf(size - 1, y + 1)) {
+                        for (nx in maxOf(0, x - 1)..minOf(size - 1, x + 1)) {
+                            val s = src[ny * size + nx]
+                            if (s != 0) found = s
+                        }
+                    }
+                    if (found != 0) map[y * size + x] = found
+                }
+            }
+        }
+        return map
+    }
+
+    /**
+     * Por triangulo: true = se puede tocar con el pincel, false = es de una parte oculta (el rayo la atraviesa, ver pickUv). null = todos visibles
+     * (lo normal: modelo sin partes o con todas visibles). Se recalcula en refreshPartVisibility.
+     */
+    @Volatile private var triVisible: BooleanArray? = null
+
+    /**
+     * Vuelve a calcular que triangulos se pueden tocar a partir de ObjMesh.partVisible. Llamar despues de mostrar u ocultar una parte (ver
+     * MyGLRenderer.setPartVisible). No usa OpenGL: se puede llamar desde cualquier hilo. Para dibujar no hace falta: drawFaces lee partVisible en cada cuadro.
+     */
+    fun refreshPartVisibility() {
+        val parts = mesh.parts
+        if (parts.isEmpty() || mesh.partVisible.all { it }) {
+            triVisible = null
+            return
+        }
+        val mask = BooleanArray(vertexCount / 3)
+        for (i in parts.indices) {
+            if (!mesh.partVisible[i]) continue
+            java.util.Arrays.fill(mask, parts[i].firstVertex / 3, (parts[i].firstVertex + parts[i].vertexCount) / 3, true)
+        }
+        triVisible = mask
+    }
+
     init {
+        refreshPartVisibility()
         val positions = mesh.positions
         val triCount = vertexCount / 3
         Thread {
@@ -269,6 +421,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
             isDaemon = true
             priority = Thread.MIN_PRIORITY
         }.start()
+        // El mapa de islas UV (ver islandMap) no se arma aca sino la primera vez que se pinta (ver islandMapOrBuild).
     }
     private val vbo: Int
     private val textureId: Int
@@ -824,8 +977,10 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * CPU (no llama a OpenGL), asi que se puede probar en cualquier hilo.
      */
     fun pickUv(ox: Float, oy: Float, oz: Float, dx: Float, dy: Float, dz: Float): FloatArray? {
+        // Triangulos de partes ocultas: el rayo los atraviesa (no se pinta lo que no se ve).
+        val visibleTris = triVisible
         // Con el acelerador listo (ver triBvh) el rayo solo prueba los triangulos de las cajas que atraviesa; si todavia no esta, recorre todos.
-        triBvh?.let { return it.pick(ox, oy, oz, dx, dy, dz, mesh.uvs) }
+        triBvh?.let { return it.pick(ox, oy, oz, dx, dy, dz, mesh.uvs, visibleTris) }
         val p = mesh.positions
         val uv = mesh.uvs
         var bestT = Float.MAX_VALUE
@@ -833,6 +988,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         var bestV = 0f
         var i = 0
         while (i + 2 < vertexCount) {
+            if (visibleTris != null && !visibleTris[i / 3]) { i += 3; continue }
             val a = i * 3
             val b = (i + 1) * 3
             val c = (i + 2) * 3
@@ -874,14 +1030,24 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * capa, se vuelve a componer solo el rectangulo tocado y ese se sube a la GPU con glTexSubImage2D.
      * IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
      */
-    fun paintDab(u: Float, v: Float, radius: Float, r: Int, g: Int, b: Int, opacity: Float = 1f, brushType: BrushType = BrushType.SOFT, erase: Boolean = false, grain: Float = 0f, grainRadius: Float = 0f) {
+    fun paintDab(u: Float, v: Float, nominalRadius: Float, r: Int, g: Int, b: Int, opacity: Float = 1f, brushType: BrushType = BrushType.SOFT, erase: Boolean = false, grain: Float = 0f, grainRadius: Float = 0f, edgeAa: Float = 0f) {
         if (released) return
         val layer = selectedLayer() ?: return
         if (layer.isFolder || layer.locked || !layer.visible) return
         val pix = layer.pixels
         val alphaLock = layer.alphaLock
+        // Buffers del trazo (se crean la primera vez, ver strokeAlpha): se leen una sola vez por toque, no en cada texel.
+        val strokeAlpha = this.strokeAlpha
+        val strokeBase = this.strokeBase
+        val strokeLastDab = this.strokeLastDab
+        // Con el borde suavizado (edgeAa > 0) el toque se extiende edgeAa / 2 mas alla del radio pedido: asi la mitad de la opacidad cae justo en el
+        // radio elegido y el trazo no queda mas fino que lo que marca el slider (sin esto la rampa se come medio texel de cada lado).
+        val radius = if (edgeAa > 0f) nominalRadius + edgeAa * 0.5f else nominalRadius
         // Con seleccion activa, cada toque se multiplica por cuanto esta seleccionado ese texel (ver selectByOpacity).
         val selMask = selectionMask
+        // El toque solo pinta dentro de la isla UV donde cae su centro (ver islandMap).
+        val isl = islandMapOrBuild()
+        val islandId = if (isl != null) islandAt(isl, u * (texSize - 1), v * (texSize - 1)) else 0
         val cx = u * (texSize - 1)
         val cy = v * (texSize - 1)
         val x0 = maxOf(0, Math.floor((cx - radius).toDouble()).toInt())
@@ -906,10 +1072,14 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
                 val ddy = y - cy
                 val d = Math.sqrt((ddx * ddx + ddy * ddy).toDouble()).toFloat()
                 if (d >= radius) continue
+                // Texel de otra isla UV: no se pinta (evita que el trazo se copie en otra pieza cercana del mapa UV).
+                if (isl != null && islandId != 0 && isl[y * texSize + x] != islandId) continue
                 // Borde segun el tipo de pincel: SOFT opaco en la mitad interior y se desvanece; HARD casi sin desvanecer;
                 // AIRBRUSH baja de forma cuadratica desde el centro (aerografo).
                 val t = 1f - d / radius
-                val falloff = brushType.falloff(t)
+                // Con edgeAa > 0 el borde se suaviza: la opacidad no puede pasar de lo que falta para llegar al borde, en texeles / edgeAa. Un
+                // borde duro y fino (radio de pocos texeles) deja de ser "pintado o no" por texel, que es lo que daba los escalones. Se queda el menor.
+                val falloff = if (edgeAa > 0f) minOf(brushType.falloff(t), (radius - d) / edgeAa) else brushType.falloff(t)
                 if (falloff <= 0f) {
                     continue
 
@@ -1074,6 +1244,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
     fun release() {
         released = true
         triBvh = null
+        islandMap = null
         GLES20.glDeleteBuffers(1, intArrayOf(vbo), 0)
         GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
         GLES20.glDeleteProgram(program)
@@ -1140,6 +1311,8 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         var minY = texSize
         var maxX = -1
         var maxY = -1
+        val strokeAlpha = this.strokeAlpha
+        val strokeBase = this.strokeBase
         for (k in us.indices) {
             val radius = radii[k]
             val cx = us[k] * (texSize - 1)
@@ -1291,10 +1464,14 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         // Con bloqueo alfa no se puede pintar donde no hay nada.
         if (alphaLock && ta == 0) return false
         val alphaOnly = ta == 0
+        // El relleno tampoco pasa a otra isla UV aunque quede pegada en la imagen (ver islandMap).
+        val isl = islandMapOrBuild()
+        val startIsland = if (isl != null) isl[startIdx] else 0
         val visited = ByteArray(n)
 
         fun canFill(idx: Int): Boolean {
             if (visited[idx].toInt() != 0 || cov[idx].toInt() == 0) return false
+            if (startIsland != 0 && isl!![idx] != startIsland) return false
             if (selMask != null && selMask[idx].toInt() == 0) return false
             val o = idx * 4
             val a = pix[o + 3].toInt() and 0xFF
@@ -1369,6 +1546,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
                     if (nx < 0 || nx >= texSize || ny < 0 || ny >= texSize) continue
                     val ni = ny * texSize + nx
                     if (visited[ni].toInt() != 0 || cov[ni].toInt() == 0) continue
+                    if (startIsland != 0 && isl!![ni] != startIsland) continue
                     if (selMask != null && selMask[ni].toInt() == 0) continue
                     val an = pix[ni * 4 + 3].toInt() and 0xFF
                     // Solo mientras el alfa sube y sin tocar lo ya opaco: se queda en el desvanecido del borde.
@@ -1423,6 +1601,8 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
     private var smudgeBuf: FloatArray? = null
     private var smudgeRad = 0
     private var smudgeValid = false
+    /** Isla UV (ver islandMap) sobre la que va el trazo de borrosidad: si el dedo pasa a otra isla, se vuelve a recoger color alli. */
+    private var smudgeIsland = 0
     /** Cuanto del color pisado se suma a lo que se arrastra en cada toque (0..1): mas bajo = la mancha llega mas lejos. */
     private val SMUDGE_PICKUP = 0.15f
 
@@ -1464,6 +1644,9 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
      */
     fun blurDab(u: Float, v: Float, radius: Float, strength: Float, brushType: BrushType = BrushType.SOFT) {
+        // Solo se difumina dentro de la isla UV donde cae el centro (ver islandMap).
+        val isl = islandMapOrBuild()
+        val islandId = if (isl != null) islandAt(isl, u * (texSize - 1), v * (texSize - 1)) else 0
         if (released) return
         val layer = selectedLayer() ?: return
         if (layer.isFolder || layer.locked || !layer.visible) return
@@ -1498,6 +1681,7 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
                 val sel = if (selMask != null) (selMask[y * texSize + x].toInt() and 0xFF) / 255f else 1f
                 val k = brushFalloff(brushType, d, radius) * strength * sel
                 if (k <= 0f) continue
+                if (isl != null && islandId != 0 && isl[y * texSize + x] != islandId) continue
                 var sumR = 0
                 var sumG = 0
                 var sumB = 0
@@ -1540,6 +1724,9 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
      * IMPORTANTE: llamar desde el hilo de render (usa OpenGL).
      */
     fun smudgeDab(u: Float, v: Float, radius: Float, strength: Float, brushType: BrushType = BrushType.SOFT) {
+        // Solo se arrastra color dentro de la isla UV donde cae el centro (ver islandMap).
+        val isl = islandMapOrBuild()
+        val islandId = if (isl != null) islandAt(isl, u * (texSize - 1), v * (texSize - 1)) else 0
         if (released) return
         val layer = selectedLayer() ?: return
         if (layer.isFolder || layer.locked || !layer.visible) return
@@ -1564,6 +1751,11 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         val y0 = maxOf(0, top)
         val y1 = minOf(texSize - 1, top + side - 1)
         if (x1 < x0 || y1 < y0) return
+        // Si el trazo pasa a otra isla UV, lo que se arrastraba ya no vale (era de la otra pieza): vuelve a recoger.
+        if (smudgeIsland != islandId) {
+            smudgeIsland = islandId
+            smudgeValid = false
+        }
         val first = !smudgeValid
         // Antes de tocar un solo pixel: guarda las baldosas de la zona para poder deshacer (el primer toque solo recoge, no cambia nada).
         if (!first) saveTilesForUndo(layer, x0, y0, x1, y1)
@@ -1571,6 +1763,8 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
             for (x in x0..x1) {
                 val o = (y * texSize + x) * 4
                 val i = ((y - top) * side + (x - left)) * 4
+                // Texel de otra isla UV: ni se toca ni se recoge.
+                if (isl != null && islandId != 0 && isl[y * texSize + x] != islandId) continue
                 val ua = pix[o + 3].toInt() and 0xFF
                 val ur = (pix[o].toInt() and 0xFF) * ua / 255f
                 val ug = (pix[o + 1].toInt() and 0xFF) * ua / 255f
@@ -1624,12 +1818,39 @@ class TexturedMeshGeometry(private val mesh: ObjMesh) {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(samplerHandle, 0)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, vertexCount)
+        drawVisibleRanges()
         GLES20.glDisableVertexAttribArray(posHandle)
         GLES20.glDisableVertexAttribArray(normalHandle)
         GLES20.glDisableVertexAttribArray(texHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         // Importante: soltar el VBO, las demas geometrias usan buffers de cliente y se romperian con un VBO enlazado.
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+    }
+
+    /**
+     * Dibuja los vertices de las partes visibles. Sin partes se dibuja todo de una vez. Con partes, las visibles que quedan una al lado de
+     * la otra se juntan en un solo glDrawArrays (con todas visibles es una sola llamada, igual que sin partes). Las partes son tramos
+     * seguidos y en orden del VBO, asi que no hace falta tocar los datos de la GPU para ocultar una.
+     */
+    private fun drawVisibleRanges() {
+        val parts = mesh.parts
+        if (parts.isEmpty()) {
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, vertexCount)
+            return
+        }
+        var runStart = -1
+        var runEnd = 0
+        for (i in parts.indices) {
+            if (!mesh.partVisible[i]) continue
+            val part = parts[i]
+            if (runStart >= 0 && part.firstVertex == runEnd) {
+                runEnd = part.firstVertex + part.vertexCount
+            } else {
+                if (runStart >= 0) GLES20.glDrawArrays(GLES20.GL_TRIANGLES, runStart, runEnd - runStart)
+                runStart = part.firstVertex
+                runEnd = part.firstVertex + part.vertexCount
+            }
+        }
+        if (runStart >= 0) GLES20.glDrawArrays(GLES20.GL_TRIANGLES, runStart, runEnd - runStart)
     }
 }

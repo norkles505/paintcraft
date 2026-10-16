@@ -214,8 +214,9 @@ class TriBvh(private val positions: FloatArray, private val triCount: Int) {
      * Rayo (origen o, direccion d, en el mismo espacio que positions) contra la malla: [t, u, v] del impacto mas cercano - t a lo largo del
      * rayo, (u, v) = la coordenada de textura interpolada con las UVs (uvs: u, v por vertice) de los 3 vertices del triangulo - o null si
      * el rayo no toca nada. Mismo resultado que recorrer todos los triangulos (Moller-Trumbore, sin descartar caras traseras).
+     * visible: si no es null, un triangulo con visible[t] = false se ignora (partes ocultas del modelo): el rayo lo atraviesa.
      */
-    fun pick(ox: Float, oy: Float, oz: Float, dx: Float, dy: Float, dz: Float, uvs: FloatArray): FloatArray? {
+    fun pick(ox: Float, oy: Float, oz: Float, dx: Float, dy: Float, dz: Float, uvs: FloatArray, visible: BooleanArray? = null): FloatArray? {
         if (triCount == 0 || nodeCount == 0) return null
         val p = positions
         val ix = if (dx > -1e-12f && dx < 1e-12f) 0f else 1f / dx
@@ -243,6 +244,7 @@ class TriBvh(private val positions: FloatArray, private val triCount: Int) {
                 val s = first[node]
                 for (k in s until s + c) {
                     val t = triIndex[k]
+                    if (visible != null && !visible[t]) continue
                     val a = t * 9
                     val e1x = p[a + 3] - p[a]; val e1y = p[a + 4] - p[a + 1]; val e1z = p[a + 5] - p[a + 2]
                     val e2x = p[a + 6] - p[a]; val e2y = p[a + 7] - p[a + 1]; val e2z = p[a + 8] - p[a + 2]

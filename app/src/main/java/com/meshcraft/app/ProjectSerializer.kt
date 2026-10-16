@@ -263,6 +263,36 @@ private fun readObjMesh(file: File): ObjMesh? {
     }
 }
 
+/**
+ * Devuelve una malla igual a mesh pero con las partes guardadas en el JSON (y cuales estaban visibles). Las partes tienen que ser tramos
+ * seguidos, de triangulos completos, que cubran toda la malla desde el vertice 0; si no (archivo danado o de otra malla), devuelve mesh
+ * sin partes en vez de fallar. La malla nueva comparte los arreglos de mesh (no se copian).
+ */
+private fun withPartsFromJson(mesh: ObjMesh, arr: JSONArray): ObjMesh {
+    val parts = ArrayList<MeshPart>()
+    val visible = ArrayList<Boolean>()
+    val positions = ArrayList<Int>()
+    var expectedFirst = 0
+    for (i in 0 until arr.length()) {
+        val p = arr.optJSONObject(i) ?: return mesh
+        val first = p.optInt("first", -1)
+        val count = p.optInt("count", -1)
+        if (first != expectedFirst || count <= 0 || count % 3 != 0) return mesh
+        parts.add(MeshPart(p.optString("name", "Parte " + (i + 1)), first, count))
+        visible.add(p.optBoolean("visible", true))
+        positions.add(p.optInt("pos", i))
+        expectedFirst = first + count
+    }
+    if (parts.size < 2 || expectedFirst != mesh.vertexCount) return mesh
+    val result = ObjMesh(mesh.positions, mesh.normals, mesh.uvs, mesh.hasUvs, parts)
+    for (i in visible.indices) result.partVisible[i] = visible[i]
+    // Orden de la lista: solo se usa si las posiciones guardadas son una permutacion valida (si no, queda el orden normal).
+    if (positions.sorted() == (0 until parts.size).toList()) {
+        for (i in positions.indices) result.partOrder[positions[i]] = i
+    }
+    return result
+}
+
 /** Borra de meshDir los binarios de mallas que ya no usa ningun objeto de la escena (objetos borrados, ids reutilizados tras File > New). */
 fun cleanupImportedMeshFiles(meshDir: File, sceneObjects: List<SceneObject>) {
     val keep = sceneObjects.filter { it.importedMesh != null }.map { importedMeshFileName(it.id) }.toSet()
@@ -289,6 +319,9 @@ fun sceneObjectsToJson(sceneObjects: List<SceneObject>, nextObjectId: Int, meshD
         o.put("rotationMatrix", obj.rotationMatrix.toJsonArray())
         o.put("shapeMatrix", obj.shapeMatrix.toJsonArray())
         o.put("selected", obj.selected)
+        // Pieza del modelo (ver ObjLoader.splitParts): su nombre y si estaba visible.
+        o.put("name", obj.name)
+        o.put("visible", obj.visible)
 
         val importedMesh = obj.importedMesh
         if (importedMesh != null) {
@@ -296,6 +329,21 @@ fun sceneObjectsToJson(sceneObjects: List<SceneObject>, nextObjectId: Int, meshD
             val fileName = importedMeshFileName(obj.id)
             writeObjMesh(importedMesh, File(meshDir, fileName))
             o.put("importedMeshFile", fileName)
+            // Partes del modelo (el binario de la malla no las lleva, ver writeObjMesh): nombre, tramo de vertices y si estaba visible.
+            if (importedMesh.parts.isNotEmpty()) {
+                val partsArray = JSONArray()
+                for ((i, part) in importedMesh.parts.withIndex()) {
+                    val po = JSONObject()
+                    po.put("name", part.name)
+                    po.put("first", part.firstVertex)
+                    po.put("count", part.vertexCount)
+                    po.put("visible", importedMesh.partVisible[i])
+                    // Posicion de la parte en la lista del panel (ver ObjMesh.partOrder).
+                    po.put("pos", importedMesh.partOrder.indexOf(i))
+                    partsArray.put(po)
+                }
+                o.put("parts", partsArray)
+            }
         }
 
         objectsArray.put(o)
@@ -328,6 +376,8 @@ fun jsonToSceneObjects(json: String, meshDir: File? = null): Pair<MutableList<Sc
             val rotationMatrix = o.getJSONArray("rotationMatrix").toFloatArray16()
             val shapeMatrix = o.getJSONArray("shapeMatrix").toFloatArray16()
             val selected = o.optBoolean("selected", false)
+            val pieceName = o.optString("name", "")
+            val pieceVisible = o.optBoolean("visible", true)
 
             // Modelo importado: su malla vive en un binario aparte (ver writeObjMesh). Si falta o esta danado, se omite el
             // objeto en vez de cargarlo como un cubo falso (el resto de la escena si se carga).
@@ -336,9 +386,12 @@ fun jsonToSceneObjects(json: String, meshDir: File? = null): Pair<MutableList<Sc
             if (meshFileName.isNotEmpty()) {
                 importedMesh = if (meshDir != null) readObjMesh(File(meshDir, File(meshFileName).name)) else null
                 if (importedMesh == null) continue
+                // Partes guardadas (proyectos viejos no las tienen: el modelo queda como una sola malla).
+                val partsJson = o.optJSONArray("parts")
+                if (partsJson != null) importedMesh = withPartsFromJson(importedMesh, partsJson)
             }
 
-            result.add(SceneObject(id, type, posX, posY, posZ, rotationMatrix, shapeMatrix, selected, importedMesh = importedMesh))
+            result.add(SceneObject(id, type, posX, posY, posZ, rotationMatrix, shapeMatrix, selected, visible = pieceVisible, importedMesh = importedMesh, name = pieceName))
         }
 
         result to nextObjectId

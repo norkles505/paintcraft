@@ -1,6 +1,42 @@
+# Gradle / Android
 .gradle/
 build/
 app/build/
 local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+output-metadata.json
+
+# Firmas (nunca subir)
+*.jks
+*.keystore
+
+# IDEs
 .idea/
 *.iml
+.vscode/
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.swp
+
+# IP del celular para depuracion por wifi (la lee compilar.bat; cambia en cada red)
+wifi_device.txt
+
+# Scripts y salidas sueltas de depuracion (empiezan con guion bajo en la raiz)
+/_*.txt
+/_*.py
+__pycache__/
+*.py[cod]
+
+# Copias de seguridad, logs y temporales
+*.bak
+*.tmp
+*.log

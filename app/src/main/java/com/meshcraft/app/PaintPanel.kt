@@ -258,6 +258,14 @@ class PaintPanel(context: Context, private val renderer: MyGLRenderer) : LinearL
         val size = brushSizes[bt] ?: bt.defaultSize
         renderer.paintRadius = size
         sizeRow.setValue(((size - 1f) * 10f).roundToInt())
+        // Un pincel importado de ibisPaint trae su propia opacidad (54 % en el "Arcane" que se probó) y ibisPaint la pone en el slider al elegirlo: se hace igual.
+        val ibis = bt.ibis
+        if (ibis != null) {
+            val pct = (ibis.opacity * 100f).roundToInt().coerceIn(1, 100)
+            renderer.paintOpacity = pct / 100f
+            opacityRow.setValue(pct)
+            colorPanel.setOpacity(pct)
+        }
     }
 
     /** Agrega a la lista un pincel importado de ibisPaint (pestaña Personalizado), lo guarda para la próxima vez y lo deja elegido. Llamar desde el hilo de la interfaz. */

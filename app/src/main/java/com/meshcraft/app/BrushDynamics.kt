@@ -9,6 +9,9 @@ package com.meshcraft.app
  *  - startLength / endLength: largo de esos desvanecidos, en diametros del pincel (0 = sin desvanecido).
  *  - opacityScale: multiplica la opacidad de todos los toques (con el dedo no hay presion; ibisPaint usa una presion supuesta).
  *  - grain: fuerza del grano 0..1 (0 = liso). Es un ruido fijo en la textura que modula la opacidad de cada toque, como el carbon.
+ *  - edgeAa: ancho en texeles del suavizado del borde (0 = el borde que define BrushType.falloff, sin tocar). Con 1, el borde de cada toque pasa de
+ *    opaco a transparente en un texel: sin esto un pincel duro y fino sale con escalones, porque cada texel queda pintado o no (ver TexturedMeshGeometry.paintDab).
+ *    Es el "antialiasing" de ibisPaint (IbisBrush.antialiasing).
  */
 class BrushDynamics(
     val startSize: Float = 1f,
@@ -18,7 +21,8 @@ class BrushDynamics(
     val startLength: Float = 0f,
     val endLength: Float = 0f,
     val opacityScale: Float = 1f,
-    val grain: Float = 0f
+    val grain: Float = 0f,
+    val edgeAa: Float = 0f
 ) {
     /** true si el principio del trazo es distinto del resto (empieza mas fino o mas transparente). */
     val hasStart: Boolean get() = startLength > 0f && (startSize < 1f || startOpacity < 1f)
@@ -45,8 +49,22 @@ class BrushDynamics(
             1 to 30f
         )
 
+        /**
+         * Largo del desvanecido SOLO DEL INICIO del trazo (diametros por cada 100 % de "longitud"), para los pinceles donde no coincide con el del final.
+         * Clave: IbisBrush.brushId, igual que FADE_DIAMETERS_PER_UNIT_BY_BRUSH.
+         *  - 149 ("Arcane, face, Body +Force Fade", pincel personalizado): 1.6. Medido en 3 trazos de ibisPaint de 56 px de ancho: la opacidad llega a
+         *    la mitad a ~11 px y al 90 % a ~32 px en los tres (casi sin variar), o sea ~0.6 diametros con el 40 %. El del final, en cambio, vale lo general
+         *    (2.8 diametros) y varia mucho de un trazo a otro (90 % a 99, 129 y 192 px): HIPOTESIS, depende de como el dedo frena.
+         */
+        val FADE_START_DIAMETERS_PER_UNIT_BY_BRUSH: Map<Int, Float> = mapOf(
+            149 to 1.6f
+        )
+
         /** Multiplicador de opacidad de los pinceles con grano: con el grano y el maximo por trazo, ibisPaint se ve con una opacidad media de 0.5 en el centro. */
         const val GRAIN_OPACITY_SCALE = 0.7f
+
+        /** Suavizado del borde, en texeles, de los pinceles de ibisPaint que tienen el antialiasing encendido (ver edgeAa). */
+        const val EDGE_AA_TEXELS = 1f
 
         /**
          * Puntas de ibisPaint que dibujan con grano (identificador de IbisBrush.tipId -> fuerza). El QR no trae la imagen de la punta, solo su

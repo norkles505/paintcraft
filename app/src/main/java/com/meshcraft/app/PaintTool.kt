@@ -85,16 +85,22 @@ class BrushType(
             val grainy = BrushDynamics.GRAINY_TIPS[b.tipId] ?: 0f
             // Largo de los desvanecidos por cada 100 % de "longitud": el medido para ese pincel de fabrica, o el general (ver BrushDynamics).
             val fadeScale = BrushDynamics.FADE_DIAMETERS_PER_UNIT_BY_BRUSH[b.brushId] ?: BrushDynamics.FADE_DIAMETERS_PER_UNIT
+            // El inicio puede medir distinto que el final (ver FADE_START_DIAMETERS_PER_UNIT_BY_BRUSH).
+            val startScale = BrushDynamics.FADE_START_DIAMETERS_PER_UNIT_BY_BRUSH[b.brushId] ?: fadeScale
             // Desvanecidos del trazo y grano (ver BrushDynamics): el grosor y la opacidad con que empieza y termina, y el largo de esos tramos.
+            // HIPOTESIS (3 pinceles probados contra ibisPaint): el grosor de inicio/fin solo se aplica si la presion afecta el grosor (la Pluma: si, y se afila;
+            // el "Arcane": no, y sale recto aunque el QR diga 0), y la opacidad de inicio/fin solo si la presion afecta la opacidad (Carboncillo y Arcane: si).
             val dynamics = BrushDynamics(
-                startSize = b.startSize.coerceIn(0f, 1f),
-                endSize = b.endSize.coerceIn(0f, 1f),
-                startOpacity = b.startOpacity.coerceIn(0f, 1f),
-                endOpacity = b.endOpacity.coerceIn(0f, 1f),
-                startLength = b.fadeStartLength.coerceAtLeast(0f) * fadeScale,
+                startSize = if (b.pressureSize > 0f) b.startSize.coerceIn(0f, 1f) else 1f,
+                endSize = if (b.pressureSize > 0f) b.endSize.coerceIn(0f, 1f) else 1f,
+                startOpacity = if (b.pressureOpacity > 0f) b.startOpacity.coerceIn(0f, 1f) else 1f,
+                endOpacity = if (b.pressureOpacity > 0f) b.endOpacity.coerceIn(0f, 1f) else 1f,
+                startLength = b.fadeStartLength.coerceAtLeast(0f) * startScale,
                 endLength = b.fadeEndLength.coerceAtLeast(0f) * fadeScale,
                 grain = grainy,
-                opacityScale = if (grainy > 0f) BrushDynamics.GRAIN_OPACITY_SCALE else 1f
+                opacityScale = if (grainy > 0f) BrushDynamics.GRAIN_OPACITY_SCALE else 1f,
+                // Antialiasing de ibisPaint (bit confirmado en el QR): borde suavizado de un texel. El Lapiz digital lo trae apagado y sigue duro.
+                edgeAa = if (b.antialiasing) BrushDynamics.EDGE_AA_TEXELS else 0f
             )
             return BrushType(b.displayName, size, spacing, falloff, b, dynamics)
         }

@@ -155,6 +155,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         sceneObjects.clear()
         sceneObjects.addAll(models)
         nextObjectId = maxOf(loadedNextId, (loadedObjects.maxOfOrNull { it.id } ?: -1) + 1)
+        activeObjectId = models.firstOrNull()?.id ?: -1
 
         // Capas pintadas guardadas: esperan a que se cree la geometria de cada modelo (ver createGeometry).
         savedLayersByMesh.clear()
@@ -190,6 +191,54 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         return newObject
     }
 
+    /**
+     * Agrega un modelo separado en piezas (ver ObjLoader.splitParts): una por parte del OBJ, cada una con su propia malla, textura, capas e
+     * historial. Reemplaza al modelo anterior, que se libera (no se puede deshacer). La primera pieza queda activa.
+     */
+    fun addImportedMeshes(pieces: List<Pair<String, ObjMesh>>) {
+        sceneObjects.clear()
+        for ((name, mesh) in pieces) {
+            sceneObjects.add(SceneObject(id = nextObjectId++, importedMesh = mesh, name = name))
+        }
+        activeObjectId = sceneObjects.firstOrNull()?.id ?: -1
+        historyResetRequested = true
+        requestGeometrySweep()
+    }
+
+    /** Malla del modelo que hay en la escena (la de la pieza activa), o null si no hay. Se puede leer desde cualquier hilo. */
+    val activeMesh: ObjMesh?
+        get() = activeObject()?.importedMesh
+
+    /**
+     * Id de la pieza activa: la que muestra el panel de capas y la que se exporta. Cambia al apoyar el pincel sobre otra pieza (ver paintStart)
+     * o al elegirla en el panel de Partes. Cada pieza tiene su propia textura y capas (ver addImportedMeshes).
+     */
+    @Volatile var activeObjectId = -1
+
+    /** Piezas del modelo: los objetos de la escena con malla importada, en orden. Se puede leer desde cualquier hilo. */
+    fun pieces(): List<SceneObject> = sceneObjects.toList().filter { it.importedMesh != null }
+
+    /** Pieza activa (ver activeObjectId) o, si no hay o ya no existe, la primera con malla. null si no hay modelo. */
+    fun activeObject(): SceneObject? {
+        val list = pieces()
+        return list.firstOrNull { it.id == activeObjectId } ?: list.firstOrNull()
+    }
+
+    /** Muestra u oculta una pieza (no se dibuja ni se puede pintar). No toca sus pixeles ni el historial. Se puede llamar desde cualquier hilo. */
+    fun setObjectVisible(objectId: Int, visible: Boolean) {
+        sceneObjects.toList().firstOrNull { it.id == objectId }?.visible = visible
+    }
+
+    /**
+     * Muestra u oculta una parte del modelo (ver ObjMesh.parts): una parte oculta no se dibuja ni se puede pintar. No toca los pixeles
+     * ni el historial de Deshacer. Se puede llamar desde cualquier hilo; despues hay que pedir un redibujado (requestRender).
+     */
+    fun setPartVisible(mesh: ObjMesh, index: Int, visible: Boolean) {
+        if (index < 0 || index >= mesh.partVisible.size) return
+        mesh.partVisible[index] = visible
+        importedGeometries[mesh]?.refreshPartVisibility()
+    }
+
     // ---- Capas (las usa LayersPanel desde el hilo de la interfaz) ----
 
     /** Ordenes pendientes para el hilo de render (ver runOnGlThread): se ejecutan al empezar cada cuadro. */
@@ -213,12 +262,8 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
      */
     val activeGeometry: TexturedMeshGeometry?
         get() {
-            for (obj in sceneObjects.toList()) {
-                val mesh = obj.importedMesh ?: continue
-                val geo = importedGeometries[mesh] ?: continue
-                return geo
-            }
-            return null
+            val mesh = activeObject()?.importedMesh ?: return null
+            return importedGeometries[mesh]
         }
 
     /**
@@ -456,7 +501,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var lastPaintHit: PaintHit? = null
 
     /** Punto de una textura (u, v en 0..1) de un modelo importado, hallado bajo un punto de pantalla. */
-    private class PaintHit(val geo: TexturedMeshGeometry, val u: Float, val v: Float)
+    private class PaintHit(val geo: TexturedMeshGeometry, val u: Float, val v: Float, val objId: Int = -1)
 
     /** Empieza un trazo: pinta un toque en (screenX, screenY). IMPORTANTE: llamar desde el hilo de render (glView.queueEvent). */
     fun paintStart(screenX: Float, screenY: Float) {
@@ -473,6 +518,11 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         for (g in importedGeometries.values) g.beginStroke()
         val startHit = pickPaintHit(screenX, screenY)
         lastPaintHit = startHit
+        // Si el trazo empieza sobre otra pieza, esa pasa a ser la activa: el panel de capas muestra sus capas (cada pieza tiene su textura).
+        if (startHit != null && startHit.objId >= 0 && startHit.objId != activeObjectId) {
+            activeObjectId = startHit.objId
+            onLayersChanged?.invoke()
+        }
         if (startHit != null) applyPaintHit(startHit)
     }
 
@@ -598,6 +648,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         var bestGeo: TexturedMeshGeometry? = null
         var bestU = 0f
         var bestV = 0f
+        var bestObjId = -1
         for (obj in sceneObjects.toList()) {
             if (!obj.visible) continue
             val mesh = obj.importedMesh ?: continue
@@ -614,10 +665,11 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 bestGeo = geo
                 bestU = hit[1]
                 bestV = hit[2]
+                bestObjId = obj.id
             }
         }
         val geo = bestGeo ?: return
-        onHit(PaintHit(geo, bestU, bestV))
+        onHit(PaintHit(geo, bestU, bestV, bestObjId))
     }
 
     // ---- Desvanecidos del trazo (ver BrushDynamics) ----
@@ -720,13 +772,13 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             }
             val dj = dabs[j]
             if (dj.hit.geo !== geo) continue
-            val rj = maxOf(0.5f, paintRadius * dj.sizeF)
+            val rj = maxOf(0.5f, paintRadius * dj.sizeF) + dyn.edgeAa * 0.5f
             for (i in 0 until n) {
                 if (!inA[i]) continue
                 val di = dabs[i]
                 val du = (dj.hit.u - di.hit.u) * texSize
                 val dv = (dj.hit.v - di.hit.v) * texSize
-                val reach = rj + maxOf(0.5f, paintRadius * di.sizeF)
+                val reach = rj + maxOf(0.5f, paintRadius * di.sizeF) + dyn.edgeAa * 0.5f
                 if (du * du + dv * dv <= reach * reach) {
                     replay[j] = true
                     break
@@ -737,7 +789,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         geo.revertStrokeCircles(
             FloatArray(aList.size) { dabs[aList[it]].hit.u },
             FloatArray(aList.size) { dabs[aList[it]].hit.v },
-            FloatArray(aList.size) { maxOf(0.5f, paintRadius * dabs[aList[it]].sizeF) }
+            FloatArray(aList.size) { maxOf(0.5f, paintRadius * dabs[aList[it]].sizeF) + dyn.edgeAa * 0.5f }
         )
         val lastSerial = geo.lastDabSerial()
         for (k in 0 until n) {
@@ -761,7 +813,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val radius = maxOf(0.5f, paintRadius * sizeF)
         hit.geo.paintDab(
             hit.u, hit.v, radius, paintColor[0], paintColor[1], paintColor[2],
-            paintOpacity * dyn.opacityScale * opacityF, paintBrushType, false, dyn.grain, paintRadius
+            paintOpacity * dyn.opacityScale * opacityF, paintBrushType, false, dyn.grain, paintRadius, dyn.edgeAa
         )
     }
 

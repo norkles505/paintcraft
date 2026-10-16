@@ -56,6 +56,7 @@ data class SceneObject(
      */
     var visible: Boolean = true,
     /** Modelo importado desde OBJ (ver ObjLoader y TexturedMeshGeometry): si no es null, se dibuja en vez de la geometria de type. */
-    var importedMesh: ObjMesh? = null
-
+    var importedMesh: ObjMesh? = null,
+    /** Nombre de la pieza (la linea o/g del OBJ de la que salio, ver ObjLoader.splitParts). Vacio si el modelo no se separo en piezas. */
+    var name: String = ""
 )
